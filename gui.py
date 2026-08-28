@@ -88,11 +88,11 @@ class SentinelGUI(ctk.CTk):
             self.after(2000, self._poll_bot_thread)
 
     def run_bot_loop(self, target_url):
-        API_KEY = os.getenv("API_KEY") or os.getenv("FREELLMAPI_KEY", "")
+        API_KEY = os.getenv("API_KEY", "")
         BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:3001/v1")
         MODEL_NAME = os.getenv("MODEL_NAME", "gemini-3.5-flash")
         if not API_KEY:
-            logging.getLogger().error("[!] Set API_KEY or FREELLMAPI_KEY in .env")
+            logging.getLogger().error("[!] Set API_KEY in .env")
             return
         
         try:

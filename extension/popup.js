@@ -283,32 +283,32 @@ hubInput.addEventListener('keydown', (e) => {
 });
 
 function probeBrain() {
-    // Backend URL lives in ONE place — background.js's BACKEND constant.
-    // The popup asks the worker instead of hardcoding its own copy.
-    chrome.runtime.sendMessage({ action: 'GET_STATUS' }, (resp) => {
-        void chrome.runtime.lastError;
-        if (!resp || resp.error || !resp.data) {
-            pulseEl.className = 'pulse offline';
-            pulseTxt.textContent = 'brain: offline';
-            return;
-        }
-        const s = resp.data;
-        const router = s.router || {};
-        const model = router.model || (s.omni && s.omni.model) || '?';
-        // r30: honest health — requires router.api_ready, not just HTTP 200.
-        if (s.dry_run) {
-            pulseEl.className = 'pulse dry';
-            pulseTxt.textContent = `brain: DRY | ${model}`;
-        } else if (router.api_ready) {
-            pulseEl.className = 'pulse online';
-            pulseTxt.textContent = `brain: router | ${model}`;
-        } else {
-            pulseEl.className = 'pulse offline';
-            const reason = router.last_error || router.api_error ||
-                (router.port_open === false ? 'port closed' : 'not ready');
-            pulseTxt.textContent = `brain: heuristic | ${reason}`;
-        }
-    });
+  chrome.runtime.sendMessage({ action: 'GET_STATUS' }, (resp) => {
+    void chrome.runtime.lastError;
+    if (!resp || resp.error || !resp.data) {
+      pulseEl.className = 'pulse offline';
+      pulseTxt.textContent = 'backend: offline';
+      return;
+    }
+
+    const status = resp.data;
+    const provider = status.provider || status.router || {};
+    const model = provider.model ||
+      (status.omni && status.omni.model) || '?';
+
+    if (status.dry_run) {
+      pulseEl.className = 'pulse dry';
+      pulseTxt.textContent = `brain: DRY | ${model}`;
+    } else if (provider.api_ready) {
+      pulseEl.className = 'pulse online';
+      pulseTxt.textContent = `brain: provider | ${model}`;
+    } else {
+      pulseEl.className = 'pulse offline';
+      const reason = provider.error || provider.last_error ||
+        provider.api_error || 'not ready';
+      pulseTxt.textContent = `brain: heuristic | ${reason}`;
+    }
+  });
 }
 
 refresh();
