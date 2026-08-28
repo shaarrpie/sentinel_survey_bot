@@ -17,7 +17,7 @@ venv/
 logs/
 screenshots/
 profiles/
-traces/
+/traces/
 panel_config.json
 answer_cache.json
 sentinel-router.log
@@ -38,6 +38,9 @@ _hub.py
 # Node
 node_modules/
 npm-debug.log*
+
+# Extension local config (token / backend override)
+/extension/config.local.js
 
 # Editors / OS
 .vscode/
