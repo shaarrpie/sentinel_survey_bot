@@ -7,7 +7,6 @@ import json
 import logging
 import msvcrt
 import datetime
-import subprocess
 import socket
 import shutil
 import re
@@ -181,32 +180,12 @@ def is_port_in_use(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(('127.0.0.1', port)) == 0
 
-def start_freellmapi_server():
-    free_llm_dir = os.getenv("FREELLM_DIR", "")
-    base_url = os.getenv("BASE_URL", "http://127.0.0.1:20128/v1")
-    proxy_port = 3001 if ":3001" in base_url else 20128
-    if not free_llm_dir or is_port_in_use(proxy_port):
-        if is_port_in_use(proxy_port):
-            logger.info(f"[+] Proxy server is already running on port {proxy_port}.")
-        return
-    logger.info(f"[*] Proxy not running on port {proxy_port}. Starting it automatically...")
-    try:
-        # Windows: `npm` resolves to a .cmd shim; Popen(..., shell=False)
-        # can't launch a .cmd via CreateProcess (WinError 2). Use npm.cmd.
-        npm = shutil.which("npm") or ("npm.cmd" if os.name == "nt" else "npm")
-        proc = subprocess.Popen([npm, "run", "dev"], cwd=free_llm_dir, shell=False, creationflags=subprocess.CREATE_NEW_CONSOLE)
-        logger.info(f"[+] Proxy server spinning up in a new window. Waiting for port {proxy_port}...")
-        for _ in range(20):
-            if is_port_in_use(proxy_port):
-                logger.info("[+] Proxy server is now online!")
-                time.sleep(2)
-                return
-            time.sleep(1)
-        logger.warning("[!] Timeout waiting for proxy. Proceeding anyway...")
-    except Exception as e:
-        logger.error(f"[-] Failed to start proxy server: {e}")
-        logger.error("[!] Entering heuristic-only mode — no LLM decisions.")
-        logger.error("[!] Manual start required:  cd %s && npm run dev  (or npx omniroute)", free_llm_dir)
+
+def provider_location(base_url: str) -> tuple[str, int]:
+    parsed = urlparse(base_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return host, port
 
 
 tesseract_cmd = os.getenv("TESSERACT_CMD") or shutil.which("tesseract") or r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -227,8 +206,13 @@ class ProfileManager:
 
 class SentinelSurveyBot:
     def __init__(self, api_key, base_url, model_name, profile_name="default_profile", sweatshop_mode=False):
-        if not is_port_in_use(20128):
-            logger.warning("[!] OmniRoute not detected on port 20128. Start it with: npx omniroute")
+        host, port = provider_location(base_url)
+        if not is_port_in_use(port) and host in {"127.0.0.1", "localhost"}:
+            logger.warning(
+                "[!] AI provider not detected at %s:%s. Start the provider configured "
+                "by BASE_URL before running the bot.",
+                host, port,
+            )
         self.ai_client = OpenAI(
             base_url=base_url,
             api_key=api_key

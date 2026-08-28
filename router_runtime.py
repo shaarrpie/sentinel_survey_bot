@@ -188,3 +188,16 @@ class RouterRuntime:
         self._health_cache = result
         self._health_checked_at = now
         return dict(result)
+
+    def health_sniff(self) -> bool:
+        """Cheap router-health check without an HTTP request.
+
+        Returns True if the router is believed to be healthy:
+        - cached health says api_ready, OR
+        - no process is tracked (we didn't spawn one), OR
+        - the tracked process is still alive.
+        """
+        if self._health_cache and self._health_cache.get("api_ready"):
+            return True
+        proc = getattr(self, "process", None)
+        return proc is None or proc.poll() is None

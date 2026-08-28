@@ -5,9 +5,6 @@ import json
 import logging
 import os
 import re
-import socket
-import subprocess
-import shutil
 import time
 import urllib.parse
 import uuid
@@ -22,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from openai import OpenAI
+from openai import OpenAI, APITimeoutError
 from PIL import Image
 
 try:
@@ -35,32 +32,37 @@ logger = logging.getLogger(__name__)
 import asyncio
 from contextlib import asynccontextmanager
 
-from router_runtime import RouterRuntime
+from provider_health import ProviderHealth
 
-router_runtime = RouterRuntime(
-    directory=os.getenv("FREELLM_DIR", ""),
-    base_url=os.getenv("BASE_URL", "http://127.0.0.1:20128/v1"),
-    api_key=os.getenv("API_KEY", "") or os.getenv("FREELLMAPI_KEY", ""),
-    model=os.getenv("MODEL_NAME", "auto/best-chat"),
-    npm_script=os.getenv("OMNI_ROUTER_SCRIPT", "dev"),
+
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
+API_KEY = os.getenv("API_KEY", "")
+MODEL_NAME = os.getenv("MODEL_NAME", "")
+
+provider_health = ProviderHealth(
+    base_url=BASE_URL,
+    api_key=API_KEY,
+    model=MODEL_NAME,
 )
 
 
 @asynccontextmanager
-async def lifespan(app):
-    started = await asyncio.to_thread(router_runtime.start)
-    if not started:
-        logger.error("[!] Router runtime: %s — heuristic-only mode",
-                     router_runtime.last_error)
+async def lifespan(app: FastAPI):
+    status = await asyncio.to_thread(provider_health.health, True)
+    if status["api_ready"]:
+        logger.info(
+            "[+] AI provider ready: %s via %s (%sms)",
+            status["model"], status["base_url"], status["latency_ms"],
+        )
+    else:
+        logger.warning(
+            "[!] AI provider unavailable: %s - heuristic fallback remains active",
+            status["error"],
+        )
     yield
-    await asyncio.to_thread(router_runtime.stop)
 
 
 app = FastAPI(lifespan=lifespan)
-
-def is_port_in_use(port):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        return s.connect_ex(('127.0.0.1', port)) == 0
 
 
 # ── trace bus (round two): ring buffer + /traces poll endpoint ──
@@ -191,9 +193,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-API_KEY = os.getenv("API_KEY") or os.getenv("FREELLMAPI_KEY", "")
-BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:3001/v1")
-MODEL = os.getenv("MODEL_NAME", "auto/best-chat")
+MODEL = MODEL_NAME
 
 # ── debugger config ──────────────────────────────────────────────
 TRACES_DIR = Path(os.getenv("SENTINEL_TRACES", "traces"))
@@ -205,7 +205,7 @@ TRACES_DIR.mkdir(parents=True, exist_ok=True)
 
 _last_debug: dict = {}                    # newest call, fully assembled
 
-client = OpenAI(api_key=API_KEY, base_url=BASE_URL) if API_KEY else None
+client = OpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=8.0, max_retries=1) if API_KEY else None
 
 # Trace-bus boot state: which LLM endpoint we're wired to (round two, §E)
 if client is not None:
@@ -215,9 +215,9 @@ if client is not None:
                 "base_url": str(BASE_URL or ""),
                 "api_key_set": bool(API_KEY)})
 else:
-    logger.error("[omni] client NOT LOADED — API_KEY/FREELLMAPI_KEY missing")
+    logger.error("[omni] client NOT LOADED — API_KEY missing")
     bus.record("sys", "state",
-               "omni router NOT LOADED — API_KEY/FREELLMAPI_KEY missing",
+               "omni router NOT LOADED — API_KEY missing",
                {"api_key_set": False}, level="error")
 
 # ── trace recorder ───────────────────────────────────────────────
@@ -664,14 +664,6 @@ async def decide(req: DecideRequest):
             memory_note="panel_hub_stop",
         )
 
-    if client is None:
-        rec.update(path="error", error="API_KEY/FREELLMAPI_KEY not set",
-                   latency_ms=int((time.time() - t0) * 1000))
-        record_trace(rec)
-        raise HTTPException(status_code=503,
-                            detail="API_KEY/FREELLMAPI_KEY not set")
-
-
     _prune_sessions()
     session_id = req.session_id
     SESSION_LAST_SEEN[session_id] = time.time()
@@ -702,6 +694,41 @@ async def decide(req: DecideRequest):
             confidence=heuristic.get("confidence", 0.2),
             actions=actions,
             memory_note=heuristic.get("memory_note"),
+            source="heuristic",
+        )
+        decision = _finish(rec, req, session_id, decision, t0, path="heuristic")
+        return decision
+
+    # ── provider health gate — if the external API is unreachable, use heuristic ──
+    health = await asyncio.to_thread(provider_health.health)
+    if not health["api_ready"] or client is None:
+        if heuristic is None:
+            try:
+                heuristic = heuristic_decide(req.elements, req.page_text)
+            except Exception:
+                heuristic = None
+        if heuristic and heuristic.get("actions"):
+            actions = heuristic["actions"]
+            note = heuristic.get("page_summary", "heuristic")
+            bus.record("backend", "heuristic",
+                       f"cycle {cycle}: provider down — LLM bypassed ({note})",
+                       {"cycle": cycle, "note": note}, level="warn")
+            decision = SurveyDecision(
+                page_summary=heuristic.get("page_summary", "heuristic"),
+                question_type=heuristic.get("question_type", "unknown"),
+                confidence=heuristic.get("confidence", 0.2),
+                actions=actions,
+                memory_note=heuristic.get("memory_note"),
+                source="heuristic",
+            )
+            decision = _finish(rec, req, session_id, decision, t0, path="heuristic")
+            return decision
+        decision = SurveyDecision(
+            page_summary="heuristic: provider down, no actions",
+            question_type="completion",
+            confidence=0.2,
+            actions=[],
+            memory_note=f"provider_down: {health['error']}",
             source="heuristic",
         )
         decision = _finish(rec, req, session_id, decision, t0, path="heuristic")
@@ -902,6 +929,36 @@ Return JSON matching the SurveyDecision schema."""
 
     except HTTPException:
         raise
+    except APITimeoutError as e:
+        logger.warning(f"[!] LLM timeout: {e} — heuristic fallback")
+        bus.record("backend", "timeout",
+                   f"cycle {cycle}: LLM timeout — heuristic fallback",
+                   {"cycle": cycle, "err": str(e)[:300]}, level="warn")
+        try:
+            heuristic = heuristic_decide(req.elements, req.page_text)
+        except Exception:
+            heuristic = None
+        if heuristic and heuristic.get("actions"):
+            decision = SurveyDecision(
+                page_summary=heuristic.get("page_summary", "heuristic"),
+                question_type=heuristic.get("question_type", "unknown"),
+                confidence=heuristic.get("confidence", 0.2),
+                actions=heuristic["actions"],
+                memory_note=heuristic.get("memory_note"),
+                source="heuristic",
+            )
+            decision = _finish(rec, req, session_id, decision, t0, path="heuristic")
+            return decision
+        decision = SurveyDecision(
+            page_summary="heuristic: timeout, no actions",
+            question_type="navigation",
+            confidence=0.2,
+            actions=[Action(action_type="next", reasoning="llm timeout — navigate")],
+            memory_note="timeout_no_actions",
+            source="heuristic",
+        )
+        decision = _finish(rec, req, session_id, decision, t0, path="heuristic")
+        return decision
     except Exception as e:
         rec.update(path="error", error=f"{type(e).__name__}: {e}",
                    latency_ms=int((time.time() - t0) * 1000))
@@ -969,7 +1026,7 @@ async def learn_rule(req: LearnRequest):
 
 @app.get("/status")
 async def status():
-    router_status = await asyncio.to_thread(router_runtime.health)
+    provider = await asyncio.to_thread(provider_health.health)
     out = {
         "status": "ok",
         "backend_ready": client is not None,
@@ -981,15 +1038,16 @@ async def status():
         "rules_count": len(LEARNED_RULES),
     }
     bus.set_omni_health(
-        loaded=router_status["api_ready"],
-        model=router_status["model"],
-        base_url=router_status["base_url"],
-        error=router_status["last_error"] or router_status["api_error"],
-        api_key_set=bool(router_runtime.api_key),
+        loaded=provider["api_ready"],
+        model=provider["model"],
+        base_url=provider["base_url"],
+        error=provider["error"],
+        api_key_set=provider["api_key_set"],
     )
     out.update(bus.snapshot())
-    out["router"] = router_status
-    out["brain"] = router_status["mode"]
+    out["provider"] = provider
+    out["router"] = provider
+    out["brain"] = provider["mode"]
     out["panel_hubs"] = list(get_panel_hub_domains())
     return out
 
@@ -1106,7 +1164,7 @@ async def debug_last():
 
 if __name__ == "__main__":
     if not API_KEY:
-        raise SystemExit("[!] Set API_KEY (or FREELLMAPI_KEY) in .env "
+        raise SystemExit("[!] Set API_KEY in .env "
                          "or the environment before starting.")
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8000)
