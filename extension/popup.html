@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root{
+    --bg0:#0d1320; --bg1:#121b2d; --line:#20304c;
+    --ink:#dbe6f5; --dim:#7e90ac; --faint:#4d5f7c;
+    --ok:#3ddc84; --ai:#59c2ff;
+  }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  body{
+    width:340px; padding:14px 14px 10px; color:var(--ink);
+    font-family:"Segoe UI","Helvetica Neue",sans-serif;
+    background:
+      radial-gradient(420px 210px at -10% -20%, rgba(89,194,255,.10), transparent 60%),
+      radial-gradient(380px 230px at 112% 122%, rgba(61,220,132,.08), transparent 62%),
+      repeating-linear-gradient(0deg,  transparent 0 23px, rgba(126,144,172,.05) 23px 24px),
+      repeating-linear-gradient(90deg, transparent 0 23px, rgba(126,144,172,.04) 23px 24px),
+      linear-gradient(160deg, var(--bg1), var(--bg0));
+  }
+  .display{
+    font-family:Bahnschrift,"Avenir Next Condensed","Arial Narrow","Segoe UI",sans-serif;
+  }
+  header{ display:flex; align-items:center; gap:12px; padding:4px 2px 13px; border-bottom:1px solid var(--line); }
+  .lamp{ width:13px; height:13px; border-radius:50%; background:#3a4a66; flex:none; }
+  body.running .lamp{
+    background:var(--ok);
+    box-shadow:0 0 0 3px rgba(61,220,132,.16), 0 0 14px rgba(61,220,132,.55);
+    animation:pulse 1.6s ease-in-out infinite;
+  }
+  body.running.alert .lamp{
+    background:#ffb347;
+    box-shadow:0 0 0 3px rgba(255,179,71,.16), 0 0 14px rgba(255,179,71,.5);
+  }
+  @keyframes pulse{ 0%,100%{transform:scale(1);} 50%{transform:scale(.76);} }
+  .stateword{ font-size:27px; font-weight:700; letter-spacing:.16em; line-height:1; color:var(--dim); }
+  body.running .stateword{ color:var(--ok); }
+  body.running.alert .stateword{ color:#ffb347; }
+  .uptime{ margin-left:auto; text-align:right; }
+  .uptime b{ display:block; font-family:ui-monospace,Consolas,monospace; font-size:16px; font-weight:600; letter-spacing:.06em; font-variant-numeric:tabular-nums; }
+  .uptime span{ font-size:9px; letter-spacing:.24em; color:var(--faint); }
+  .stats{ display:flex; gap:16px; padding:9px 2px; font-family:ui-monospace,Consolas,monospace; font-size:10.5px; color:var(--dim); border-bottom:1px solid var(--line); font-variant-numeric:tabular-nums; }
+  .stats b{ color:var(--ink); font-weight:600; }
+  .stats .p b{ color:#ff6161; }
+  .loghead{ display:flex; justify-content:space-between; padding:9px 2px 5px; font-size:9px; letter-spacing:.26em; color:var(--faint); }
+  #logs{
+    height:170px; overflow-y:auto; border:1px solid var(--line); border-radius:5px;
+    padding:6px 7px; background:rgba(8,12,21,.74);
+    font-family:ui-monospace,Consolas,monospace; font-size:10.5px; line-height:1.55;
+  }
+  #logs::-webkit-scrollbar{ width:8px; }
+  #logs::-webkit-scrollbar-thumb{ background:#22304a; border-radius:4px; }
+  .empty{ color:var(--faint); font-style:italic; padding:6px 2px; }
+  .row{ display:flex; gap:7px; animation:in .18s ease-out; }
+  @keyframes in{ from{opacity:0; transform:translateY(3px);} to{opacity:1; transform:none;} }
+  .row time{ color:var(--faint); flex:none; }
+  .row .msg{ white-space:pre-wrap; word-break:break-word; }
+  .ok .msg{ color:var(--ok); }      .err .msg{ color:#ff6161; }
+  .warn .msg{ color:#ffb347; }      .ai .msg{ color:var(--ai); }
+  .act .msg{ color:#9db4d6; }       .dim .msg{ color:var(--dim); }
+  .info .msg{ color:#c3d2e8; }
+  .controls{ display:flex; gap:8px; margin-top:11px; }
+  button{
+    padding:9px 0; border:none; border-radius:5px;
+    font-family:inherit; font-size:12px; font-weight:700; letter-spacing:.14em;
+    cursor:pointer; transition:transform .06s ease, filter .15s ease;
+  }
+  button:active:not(:disabled){ transform:translateY(1px); }
+  button:disabled{ opacity:.38; cursor:default; }
+  #start{ flex:1; background:var(--ok); color:#07301a; }
+  #start:hover:not(:disabled){ filter:brightness(1.08); }
+  #stop{ flex:1; background:#7f2f35; color:#ffd9d9; }
+  #stop:hover:not(:disabled){ filter:brightness(1.12); }
+  #openhud{
+    flex:0 0 64px; background:transparent; color:var(--ai);
+    border:1px solid #2a4a6e;
+  }
+  #openhud:hover{ background:rgba(89,194,255,.10); }
+  #opendebug{
+    flex:0 0 74px; background:transparent; color:#ffb347;
+    border:1px solid #4a3a20;
+  }
+  #opendebug:hover{ background:rgba(255,179,71,.10); }
+  .foot{ display:flex; justify-content:space-between; margin-top:9px; font-family:ui-monospace,Consolas,monospace; font-size:9px; color:var(--faint); }
+  .pulse{ display:inline-flex; align-items:center; gap:5px; font-family:ui-monospace,Consolas,monospace; font-size:10px; color:var(--faint); }
+  .pulse .dot{ width:7px; height:7px; border-radius:50%; background:var(--faint); transition:background .3s, box-shadow .3s; }
+  .pulse.online .dot{ background:var(--ok); box-shadow:0 0 8px rgba(61,220,132,.7); }
+  .pulse.dry .dot{ background:#ffb347; box-shadow:0 0 8px rgba(255,179,71,.7); }
+  .pulse.offline .dot{ background:#ff6161; box-shadow:0 0 8px rgba(255,97,97,.7); }
+  .hub{ margin-top:11px; padding:9px 0; border-top:1px solid var(--line); }
+  .hublabel{ font-size:9px; letter-spacing:.26em; color:var(--faint); margin-bottom:6px; }
+  .hubrow{ display:flex; gap:6px; }
+  #hubInput{
+    flex:1; min-width:0; padding:7px 8px; border:1px solid var(--line);
+    border-radius:5px; background:rgba(8,12,21,.74); color:var(--ink);
+    font-family:ui-monospace,Consolas,monospace; font-size:10.5px;
+  }
+  #hubInput::placeholder{ color:var(--faint); }
+  #hubInput:focus{ outline:none; border-color:#2a4a6e; }
+  #saveHub{
+    flex:0 0 52px; padding:7px 0; background:transparent; color:var(--ok);
+    border:1px solid #24503a;
+  }
+  #saveHub:hover:not(:disabled){ background:rgba(61,220,132,.10); }
+  #clearHub{
+    flex:0 0 52px; padding:7px 0; background:transparent; color:#ff8484;
+    border:1px solid #4a2626;
+  }
+  #clearHub:hover:not(:disabled){ background:rgba(255,97,97,.10); }
+  #grabTab{
+    flex:0 0 34px; padding:7px 0; background:transparent; color:var(--ai);
+    border:1px solid #2a4a6e;
+  }
+  #grabTab:hover:not(:disabled){ background:rgba(89,194,255,.10); }
+  .hubstatus{
+    margin-top:5px; font-family:ui-monospace,Consolas,monospace;
+    font-size:9.5px; color:var(--dim); white-space:pre-wrap; word-break:break-word;
+  }
+  .hubstatus.ok{ color:var(--ok); }   .hubstatus.err{ color:#ff6161; }
+  @media (prefers-reduced-motion: reduce){ .lamp, .row{ animation:none !important; } }
+</style>
+</head>
+<body>
+  <header>
+    <div class="lamp"></div>
+    <div class="stateword display" id="stateword">STOPPED</div>
+    <div class="uptime">
+      <b id="uptime">--:--:--</b>
+      <span>UPTIME</span>
+    </div>
+    <div class="pulse" id="pulse" title="backend status"><i class="dot"></i><span id="pulseTxt">brain: …</span></div>
+  </header>
+
+  <div class="stats">
+    <span>DECISIONS <b id="stDec">0</b></span>
+    <span>ACTIONS <b id="stAct">0</b></span>
+    <span class="p">PROBLEMS <b id="stErr">0</b></span>
+  </div>
+
+  <div class="loghead">
+    <span>DEBUG CONSOLE</span>
+    <span id="buffer">buffer 0/200</span>
+  </div>
+  <div id="logs"><div class="empty">— waiting for first signal —</div></div>
+
+  <div class="hub">
+    <div class="hublabel">PANEL HUB <span style="letter-spacing:.08em">(bot stops here instead of filling login walls)</span></div>
+    <div class="hubrow">
+      <input id="hubInput" type="text" spellcheck="false"
+             placeholder="https://panel.example.com/login" />
+      <button id="grabTab" title="use the current tab's URL">⌖</button>
+      <button id="saveHub">SAVE</button>
+      <button id="clearHub" title="remove all panel hubs">×</button>
+    </div>
+    <div class="hubstatus" id="hubStatus">…</div>
+  </div>
+
+  <div class="controls">
+    <button id="start">▶ START</button>
+    <button id="stop">■ STOP</button>
+    <button id="openhud" title="open floating HUD">◫ HUD</button>
+    <button id="opendebug" title="open trace replay console">⌨ DEBUG</button>
+  </div>
+
+  <div class="foot">
+    <span>backend 127.0.0.1:8000</span>
+    <span id="tabinfo"></span>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

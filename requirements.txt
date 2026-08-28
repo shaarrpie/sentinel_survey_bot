@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+openai
+pydantic
+Pillow
+python-dotenv
+playwright
+httpx
+imagehash
+customtkinter
+pytesseract
+undetected-chromedriver

@@ -1,0 +1,119 @@
+2026-06-07 14:24:31,819 - INFO - ==========================================
+2026-06-07 14:24:31,820 - INFO -    SentinelCore Survey Bot Initialized    
+2026-06-07 14:24:31,820 - INFO - ==========================================
+2026-06-07 14:24:31,820 - INFO - [*] Spooling up stealth browser instance...
+2026-06-07 14:24:32,350 - INFO - [*] Loading Cookie Vault for Profile: mumbai_hr_executive_01...
+2026-06-07 14:24:32,350 - INFO - [*] Spooling up stealth browser fingerprint...
+2026-06-07 14:24:46,430 - INFO - patching driver executable C:\Users\tiajungba\appdata\roaming\undetected_chromedriver\undetected_chromedriver.exe
+2026-06-07 14:26:48,960 - INFO - [*] Navigating to https://click.cpx-research.com/?k=ZFV4cHBCTlBoZkdnUUZBdGNCR2hJOHlzemFEOUt2TW5sdnUvMXdMSWhUZkdGdzBMb2lHeXdsVThjWkFZNFRjZmpmcGF3eVdTRFJVbGFiV3VzWDIwa0VRSlVtd0tSbGcrZFNUQmJabktpcTlXYzE5a1hMQVJxSVdmL0d2ZlB4NmU=&from_offers=true&timestamp=1780821775&subid_1=3140883355&subid_2=...
+2026-06-07 14:27:05,121 - INFO - [+] SentinelCore Manual HUD Active. Monitoring screen for questions...
+2026-06-07 14:27:06,782 - INFO - 
+============================================================
+2026-06-07 14:27:06,782 - INFO - [*] New Question Detected! (Open-Ended) Asking AI...
+2026-06-07 14:27:11,081 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:27:11,097 - INFO - 
+[🤖 AI SUGGESTS TYPING]:
+name@mail.com
+
+2026-06-07 14:27:11,097 - INFO - ============================================================
+
+2026-06-07 14:28:51,650 - INFO - 
+============================================================
+2026-06-07 14:28:51,650 - INFO - [*] New Question Detected! (2 options) Asking AI...
+2026-06-07 14:29:00,574 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:29:00,575 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+Woman
+
+2026-06-07 14:29:00,575 - INFO - ============================================================
+
+2026-06-07 14:29:08,241 - INFO - 
+============================================================
+2026-06-07 14:29:08,242 - INFO - [*] New Question Detected! (18 options) Asking AI...
+2026-06-07 14:29:11,404 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:29:11,406 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+English|Hindi|Marathi|Gujarati|Urdu
+
+2026-06-07 14:29:11,406 - INFO - ============================================================
+
+2026-06-07 14:30:45,603 - INFO - 
+============================================================
+2026-06-07 14:30:45,604 - INFO - [*] New Question Detected! (10 options) Asking AI...
+2026-06-07 14:30:46,395 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:30:46,396 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+मास्टर्स
+
+2026-06-07 14:30:46,396 - INFO - ============================================================
+
+2026-06-07 14:31:38,579 - INFO - 
+============================================================
+2026-06-07 14:31:38,579 - INFO - [*] New Question Detected! (7 options) Asking AI...
+2026-06-07 14:31:49,192 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:31:49,195 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+West
+
+2026-06-07 14:31:49,195 - INFO - ============================================================
+
+2026-06-07 14:32:07,242 - INFO - 
+============================================================
+2026-06-07 14:32:07,242 - INFO - [*] New Question Detected! (3 options) Asking AI...
+2026-06-07 14:32:09,471 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:32:09,473 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+English
+
+2026-06-07 14:32:09,475 - INFO - ============================================================
+
+2026-06-07 14:33:07,137 - INFO - 
+============================================================
+2026-06-07 14:33:07,139 - INFO - [*] New Question Detected! (110 options) Asking AI...
+2026-06-07 14:33:09,372 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:33:09,375 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+Mumbai
+
+2026-06-07 14:33:09,376 - INFO - ============================================================
+
+2026-06-07 14:36:14,469 - INFO - 
+============================================================
+2026-06-07 14:36:14,470 - INFO - [*] New Question Detected! (1 options) Asking AI...
+2026-06-07 14:36:15,819 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:36:15,822 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+Mumbai
+
+2026-06-07 14:36:15,823 - INFO - ============================================================
+
+2026-06-07 14:36:17,437 - INFO - 
+============================================================
+2026-06-07 14:36:17,437 - INFO - [*] New Question Detected! (Open-Ended) Asking AI...
+2026-06-07 14:36:18,861 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:36:18,862 - INFO - 
+[🤖 AI SUGGESTS TYPING]:
+1200000
+
+2026-06-07 14:36:18,863 - INFO - ============================================================
+
+2026-06-07 14:36:28,626 - INFO - 
+============================================================
+2026-06-07 14:36:28,626 - INFO - [*] New Question Detected! (13 options) Asking AI...
+2026-06-07 14:36:29,597 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:36:29,599 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+C2
+
+2026-06-07 14:36:29,599 - INFO - ============================================================
+
+2026-06-07 14:37:02,068 - INFO - 
+============================================================
+2026-06-07 14:37:02,069 - INFO - [*] New Question Detected! (639 options) Asking AI...
+2026-06-07 14:37:10,394 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:37:10,397 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+Mumbai
+
+2026-06-07 14:37:10,397 - INFO - ============================================================
+

@@ -1,0 +1,30 @@
+2026-06-07 13:49:35,278 - INFO - ==========================================
+2026-06-07 13:49:35,279 - INFO -    SentinelCore Survey Bot Initialized    
+2026-06-07 13:49:35,279 - INFO - ==========================================
+2026-06-07 13:49:35,279 - INFO - [*] Spooling up stealth browser instance...
+2026-06-07 13:49:35,938 - INFO - [*] Loading Cookie Vault for Profile: mumbai_hr_executive_01...
+2026-06-07 13:49:35,939 - INFO - [*] Spooling up stealth browser fingerprint...
+2026-06-07 13:50:09,134 - INFO - patching driver executable C:\Users\tiajungba\appdata\roaming\undetected_chromedriver\undetected_chromedriver.exe
+2026-06-07 13:51:09,381 - INFO - [*] Navigating to Survey #1...
+2026-06-07 13:51:09,383 - INFO - [*] Navigating to https://www.ysense.com/surveys/prescreener-v2?callback=https%3A%2F%2Fgo.ysense.com%2Fsurvey-click%2Fv2%3FflowId%3Df7a34297c71343a0bbb43ea679551cbb%26hsh%3D8be05b7cabf299c709a5ee673bb48511f04eb3dab8d7a40abe2b3d9ab1013ff3...
+2026-06-07 13:51:11,142 - INFO - [+] SentinelCore Manual HUD Active. Monitoring screen for questions...
+2026-06-07 13:51:12,776 - INFO - 
+============================================================
+2026-06-07 13:51:12,776 - INFO - [*] New Question Detected! (Open-Ended) Asking AI...
+2026-06-07 13:51:36,810 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 13:51:36,853 - INFO - 
+[🤖 AI SUGGESTS TYPING]:
+Ugh, finally! I've been waiting for this survey to load. Let's get this done quickly, I have a meeting in 10 minutes.
+
+2026-06-07 13:51:36,853 - INFO - ============================================================
+
+2026-06-07 13:51:39,010 - INFO - 
+============================================================
+2026-06-07 13:51:39,010 - INFO - [*] New Question Detected! (16 options) Asking AI...
+2026-06-07 13:51:45,093 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 13:51:45,094 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+languages.Bengali|English|languages.Hindi|languages.Kannada|languages.Malayalam|languages.Marathi|languages.Tamil|languages.Telugu
+
+2026-06-07 13:51:45,095 - INFO - ============================================================
+

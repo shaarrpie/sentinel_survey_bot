@@ -1,0 +1,165 @@
+2026-06-07 13:57:15,316 - INFO - ==========================================
+2026-06-07 13:57:15,316 - INFO -    SentinelCore Survey Bot Initialized    
+2026-06-07 13:57:15,316 - INFO - ==========================================
+2026-06-07 13:57:15,317 - INFO - [*] Spooling up stealth browser instance...
+2026-06-07 13:57:15,980 - INFO - [*] Loading Cookie Vault for Profile: mumbai_hr_executive_01...
+2026-06-07 13:57:15,981 - INFO - [*] Spooling up stealth browser fingerprint...
+2026-06-07 13:58:36,711 - INFO - patching driver executable C:\Users\tiajungba\appdata\roaming\undetected_chromedriver\undetected_chromedriver.exe
+2026-06-07 13:59:20,335 - INFO - [*] Navigating to Survey #1...
+2026-06-07 13:59:20,336 - INFO - [*] Navigating to https://web.bitlabs.ai/click-embed/bd91d5cd-df2c-4286-93d0-ffbb6d2415f5?token=dda076e6-8dfa-4f14-b6dd-b9bc5c1e93eb&uid=148035693...
+2026-06-07 13:59:20,549 - INFO - [+] SentinelCore Manual HUD Active. Monitoring screen for questions...
+2026-06-07 13:59:22,722 - INFO - 
+============================================================
+2026-06-07 13:59:22,722 - INFO - [*] New Question Detected! (16 options) Asking AI...
+2026-06-07 13:59:26,501 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 13:59:26,519 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+English|languages.Hindi|languages.Marathi
+
+2026-06-07 13:59:26,519 - INFO - ============================================================
+
+2026-06-07 14:00:17,865 - INFO - 
+============================================================
+2026-06-07 14:00:17,865 - INFO - [*] New Question Detected! (16 options) Asking AI...
+2026-06-07 14:00:20,390 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:00:20,392 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+Full-time
+
+2026-06-07 14:00:20,393 - INFO - ============================================================
+
+2026-06-07 14:02:43,274 - INFO - 
+============================================================
+2026-06-07 14:02:43,275 - INFO - [*] New Question Detected! (98 options) Asking AI...
+2026-06-07 14:02:46,602 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:02:46,604 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+Computer Software
+
+2026-06-07 14:02:46,604 - INFO - ============================================================
+
+2026-06-07 14:05:56,156 - INFO - 
+============================================================
+2026-06-07 14:05:56,157 - INFO - [*] New Question Detected! (20 options) Asking AI...
+2026-06-07 14:05:59,330 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:05:59,334 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+₹ 10,00,000 to ₹ 14,99,999
+
+2026-06-07 14:05:59,334 - INFO - ============================================================
+
+2026-06-07 14:06:14,148 - INFO - 
+============================================================
+2026-06-07 14:06:14,148 - INFO - [*] New Question Detected! (48 options) Asking AI...
+2026-06-07 14:06:16,465 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:06:16,467 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+₹ 1,200,000 - ₹ 1,249,999
+
+2026-06-07 14:06:16,468 - INFO - ============================================================
+
+2026-06-07 14:08:06,370 - INFO - 
+============================================================
+2026-06-07 14:08:06,370 - INFO - [*] New Question Detected! (40 options) Asking AI...
+2026-06-07 14:08:09,789 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:08:09,793 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+पूर्णकालिक कार्यरत
+
+2026-06-07 14:08:09,794 - INFO - ============================================================
+
+2026-06-07 14:08:27,640 - INFO - 
+============================================================
+2026-06-07 14:08:27,641 - INFO - [*] New Question Detected! (22 options) Asking AI...
+2026-06-07 14:08:31,539 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:08:31,540 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+निदेशक (समूह निदेशक, वरिष्ठ निदेशक, निदेशक)
+
+2026-06-07 14:08:31,542 - INFO - ============================================================
+
+2026-06-07 14:10:09,244 - INFO - 
+============================================================
+2026-06-07 14:10:09,245 - INFO - [*] New Question Detected! (18 options) Asking AI...
+2026-06-07 14:10:12,462 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:10:12,464 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+मास्टर्स
+
+2026-06-07 14:10:12,465 - INFO - ============================================================
+
+2026-06-07 14:10:30,254 - INFO - 
+============================================================
+2026-06-07 14:10:30,254 - INFO - [*] New Question Detected! (18 options) Asking AI...
+2026-06-07 14:10:33,257 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:10:33,259 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+मास्टर्स
+
+2026-06-07 14:10:33,260 - INFO - ============================================================
+
+2026-06-07 14:10:38,508 - INFO - 
+============================================================
+2026-06-07 14:10:38,508 - INFO - [*] New Question Detected! (104 options) Asking AI...
+2026-06-07 14:10:41,406 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:10:41,407 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+कंप्यूटर सॉफ्टवेयर
+
+2026-06-07 14:10:41,408 - INFO - ============================================================
+
+2026-06-07 14:11:04,331 - INFO - 
+============================================================
+2026-06-07 14:11:04,332 - INFO - [*] New Question Detected! (74 options) Asking AI...
+2026-06-07 14:11:07,463 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:11:07,466 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+4 साल की उम्र की लड़की|7 साल की उम्र का लड़का
+
+2026-06-07 14:11:07,466 - INFO - ============================================================
+
+2026-06-07 14:12:22,872 - INFO - 
+============================================================
+2026-06-07 14:12:22,872 - INFO - [*] New Question Detected! (2 options) Asking AI...
+2026-06-07 14:12:30,984 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:12:30,986 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+Sort: 
+                                    
+Featured
+                                    Reward
+                                    Time
+                                    Date
+
+2026-06-07 14:12:30,986 - INFO - ============================================================
+
+2026-06-07 14:12:32,951 - INFO - 
+============================================================
+2026-06-07 14:12:32,952 - INFO - [*] New Question Detected! (2 options) Asking AI...
+2026-06-07 14:12:38,323 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:12:38,324 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+Sort: 
+                                    
+Featured
+                                    Reward
+                                    Time
+                                    Date
+
+2026-06-07 14:12:38,325 - INFO - ============================================================
+
+2026-06-07 14:13:21,627 - INFO - 
+============================================================
+2026-06-07 14:13:21,628 - INFO - [*] New Question Detected! (2 options) Asking AI...
+2026-06-07 14:13:26,464 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 14:13:26,467 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+Sort: 
+                                    
+Featured
+                                    Reward
+                                    Time
+                                    Date
+
+2026-06-07 14:13:26,468 - INFO - ============================================================
+

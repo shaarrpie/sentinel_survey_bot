@@ -1,0 +1,23 @@
+2026-06-07 15:01:00,434 - INFO - ==========================================
+2026-06-07 15:01:00,434 - INFO -    SentinelCore Survey Bot Initialized    
+2026-06-07 15:01:00,434 - INFO - ==========================================
+2026-06-07 15:01:00,434 - INFO - [*] Spooling up stealth browser instance...
+2026-06-07 15:01:00,983 - INFO - [*] Loading Cookie Vault for Profile: mumbai_hr_executive_01...
+2026-06-07 15:01:00,984 - INFO - [*] Spooling up stealth browser fingerprint...
+2026-06-07 15:01:00,984 - INFO - [*] Attempting to attach to existing Chrome instance on port 9222...
+2026-06-07 15:01:21,913 - INFO - patching driver executable C:\Users\tiajungba\appdata\roaming\undetected_chromedriver\undetected_chromedriver.exe
+2026-06-07 15:01:25,692 - INFO - [+] Successfully attached to existing Chrome window!
+2026-06-07 15:03:39,611 - INFO - [*] Navigating to https://click.cpx-research.com/?k=ZFV4cHBCTlBoZkdnUUZBdGNCR2hJOHlzemFEOUt2TW5sdnUvMXdMSWhUZkdGdzBMb2lHeXdsVThjWkFZNFRjZktoTUJHVUtGaXdkRkVnTG84N3VFRjdKZlZPR1prYjF2cGN4ZmpGUFRrbmp3Z2xRUU9DdGR5MkZMZUU2NkRIRzJFbnVIMmZhTUl6OU9NS1RwbXE4QUJVcGZKUUxndWdscTc1TXRKcnNXRzJBPQ==&api=true&time_stamp=1780823204&subid_1=3140883355&subid_2=&rsurv_id=69105057&profiler_count=6...
+2026-06-07 15:03:43,967 - INFO - [+] SentinelCore Manual HUD Active. Monitoring screen for questions...
+2026-06-07 15:03:55,113 - INFO - 
+============================================================
+2026-06-07 15:03:55,114 - INFO - [*] New Question Detected! (639 options) Asking AI...
+2026-06-07 15:03:57,339 - INFO - HTTP Request: POST http://127.0.0.1:3001/v1/chat/completions "HTTP/1.1 200 OK"
+2026-06-07 15:03:57,352 - INFO - 
+[🤖 AI SUGGESTS CLICKING]:
+Mumbai
+
+2026-06-07 15:03:57,352 - INFO - ============================================================
+
+2026-06-07 15:04:17,921 - INFO - 
+[+] SentinelCore Operation Halted by User.

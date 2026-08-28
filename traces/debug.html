@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Sentinel — Trace Replay</title>
+<style>
+  :root{
+    --bg0:#0d1320; --bg1:#121b2d; --line:#20304c;
+    --ink:#dbe6f5; --dim:#7e90ac; --faint:#4d5f7c;
+    --ok:#3ddc84; --ai:#59c2ff; --warn:#ffb347; --err:#ff6161;
+  }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  html,body{ height:100%; }
+  body{
+    color:var(--ink); font-family:ui-monospace,Consolas,monospace; font-size:12px;
+    background:
+      radial-gradient(560px 260px at -8% -14%, rgba(89,194,255,.09), transparent 60%),
+      radial-gradient(520px 300px at 108% 116%, rgba(61,220,132,.07), transparent 62%),
+      repeating-linear-gradient(0deg,  transparent 0 23px, rgba(126,144,172,.05) 23px 24px),
+      repeating-linear-gradient(90deg, transparent 0 23px, rgba(126,144,172,.04) 23px 24px),
+      linear-gradient(160deg, var(--bg1), var(--bg0));
+    display:flex; flex-direction:column; height:100vh; overflow:hidden;
+  }
+  .display{ font-family:Bahnschrift,"Avenir Next Condensed","Arial Narrow",sans-serif; }
+
+  /* ── header ── */
+  header{
+    display:flex; align-items:center; gap:14px; padding:10px 16px;
+    border-bottom:1px solid var(--line); flex:none;
+  }
+  header h1{ font-size:19px; letter-spacing:.18em; font-weight:700; }
+  header h1 i{ color:var(--ai); font-style:normal; }
+  .chips{ display:flex; gap:8px; }
+  .chip{
+    display:inline-flex; align-items:center; gap:6px; padding:3px 9px;
+    border:1px solid var(--line); border-radius:4px; font-size:10px;
+    letter-spacing:.08em; color:var(--dim); background:rgba(8,12,21,.5);
+    transition:border-color .25s, color .25s;
+  }
+  .chip .dot{ width:7px; height:7px; border-radius:50%; background:var(--faint);
+    transition:background .3s, box-shadow .3s; }
+  .chip.up{ color:var(--ink); border-color:#2c4a3a; }
+  .chip.up .dot{ background:var(--ok); box-shadow:0 0 8px rgba(61,220,132,.7); }
+  .chip.down{ color:#ff9c9c; border-color:#5a2a2e; }
+  .chip.down .dot{ background:var(--err); box-shadow:0 0 8px rgba(255,97,97,.7); }
+  .chip.warn{ color:#ffd9a0; border-color:#5a4326; }
+  .chip.warn .dot{ background:var(--warn); box-shadow:0 0 8px rgba(255,179,71,.7); }
+  .spacer{ flex:1; }
+  button{
+    font-family:inherit; font-size:10.5px; font-weight:700; letter-spacing:.14em;
+    padding:6px 12px; border-radius:4px; cursor:pointer; color:var(--dim);
+    background:transparent; border:1px solid var(--line);
+    transition:color .15s, border-color .15s, background .15s, transform .06s;
+  }
+  button:hover{ color:var(--ink); border-color:#33507c; background:rgba(89,194,255,.07); }
+  button:active{ transform:translateY(1px); }
+  button.on{ color:var(--warn); border-color:#5a4326; background:rgba(255,179,71,.08); }
+
+  /* ── omni strip ── */
+  #omni{
+    flex:none; display:flex; align-items:center; gap:18px; padding:9px 16px;
+    border-bottom:1px solid var(--line); background:rgba(8,12,21,.45);
+    font-size:10.5px; color:var(--dim); flex-wrap:wrap;
+  }
+  #omni .lbl{ font-size:9px; letter-spacing:.26em; color:var(--faint); }
+  #omni b{ color:var(--ink); font-weight:600; }
+  #omniState{ font-size:12px; letter-spacing:.14em; font-weight:700; color:var(--faint); }
+  #omniState.up{ color:var(--ok); }  #omniState.down{ color:var(--err); }
+  .latbar{ display:inline-block; width:70px; height:6px; border-radius:3px;
+    background:#1a2438; overflow:hidden; vertical-align:middle; margin-right:6px; }
+  .latbar i{ display:block; height:100%; width:0%; background:var(--ok);
+    transition:width .4s ease, background .4s; }
+  .latbar i.slow{ background:var(--warn); }  .latbar i.bad{ background:var(--err); }
+
+  /* ── filter row ── */
+  #filters{ flex:none; display:flex; align-items:center; gap:8px;
+    padding:8px 16px; border-bottom:1px solid var(--line); }
+  .fchip{ padding:4px 10px; border-radius:4px; font-size:10px; letter-spacing:.12em;
+    color:var(--dim); border:1px solid var(--line); cursor:pointer; user-select:none;
+    transition:all .15s; }
+  .fchip:hover{ color:var(--ink); border-color:#33507c; }
+  .fchip.on{ color:#07301a; background:var(--ok); border-color:var(--ok); font-weight:700; }
+  #q{ flex:1; min-width:120px; background:rgba(8,12,21,.6); border:1px solid var(--line);
+    border-radius:4px; color:var(--ink); font-family:inherit; font-size:11px;
+    padding:5px 9px; outline:none; transition:border-color .2s; }
+  #q:focus{ border-color:#33507c; }
+  #lvl{ background:rgba(8,12,21,.6); color:var(--dim); border:1px solid var(--line);
+    border-radius:4px; font-family:inherit; font-size:10.5px; padding:4px 6px; }
+  #count{ font-size:10px; color:var(--faint); letter-spacing:.08em; white-space:nowrap; }
+
+  /* ── main split ── */
+  main{ flex:1; display:flex; min-height:0; }
+  #stream{ flex:1; overflow-y:auto; padding:6px 10px; }
+  #stream::-webkit-scrollbar{ width:9px; }
+  #stream::-webkit-scrollbar-thumb{ background:#22304a; border-radius:5px; }
+
+  .tr{
+    display:flex; align-items:baseline; gap:8px; padding:2px 8px; border-radius:4px;
+    border-left:2px solid transparent; cursor:default;
+    animation:in .16s ease-out;
+  }
+  @keyframes in{ from{opacity:0; transform:translateY(3px);} to{opacity:1; transform:none;} }
+  .tr:hover{ background:rgba(89,194,255,.05); }
+  .tr .seq{ color:var(--faint); font-size:9.5px; width:44px; flex:none; text-align:right; }
+  .tr time{ color:var(--faint); font-size:10px; flex:none; }
+  .tag{ font-size:8.5px; letter-spacing:.14em; padding:1px 6px; border-radius:3px;
+    border:1px solid var(--line); color:var(--dim); flex:none; }
+  .s-content .tag.src{ color:#9db4d6; border-color:#2c3d5c; }
+  .s-backend .tag.src{ color:var(--ai);  border-color:#2a4a6e; }
+  .s-omni    .tag.src{ color:#c792ea; border-color:#4a3560; }
+  .s-sys     .tag.src{ color:var(--dim); }
+  .tr .ms{ flex:none; font-size:9.5px; color:var(--faint); width:86px; }
+  .tr .ms .latbar{ width:44px; height:4px; }
+  .tr .msg{ flex:1; white-space:pre-wrap; word-break:break-word; color:#c3d2e8; }
+  .tr.error .msg{ color:var(--err); }  .tr.error{ border-left-color:var(--err); }
+  .tr.warn  .msg{ color:var(--warn); } .tr.warn{ border-left-color:var(--warn); }
+  .tr .x{ flex:none; color:var(--faint); width:12px; cursor:pointer; user-select:none; }
+  .tr .x:hover{ color:var(--ai); }
+  .payload{
+    grid-column:1/-1; display:none; margin:4px 0 6px 52px; padding:8px 10px;
+    background:rgba(8,12,21,.75); border:1px solid var(--line); border-radius:4px;
+    font-size:10.5px; line-height:1.5; color:#a8c0e0; white-space:pre-wrap;
+    word-break:break-word; max-height:260px; overflow-y:auto;
+  }
+  .tr{ flex-wrap:wrap; }
+  .tr.open .payload{ display:block; }
+  .tr.open{ background:rgba(89,194,255,.06); }
+  .tr.hasdata{ cursor:pointer; }
+
+  /* ── cycles rail ── */
+  #cycles{
+    flex:0 0 250px; border-left:1px solid var(--line); overflow-y:auto;
+    padding:10px 12px; background:rgba(8,12,21,.35);
+  }
+  #cycles::-webkit-scrollbar{ width:8px; }
+  #cycles::-webkit-scrollbar-thumb{ background:#22304a; border-radius:4px; }
+  #cycles h2{ font-size:10px; letter-spacing:.26em; color:var(--faint); margin-bottom:9px; }
+  .cyc{ border:1px solid var(--line); border-radius:5px; padding:8px 9px; margin-bottom:8px;
+    background:rgba(18,27,45,.5); transition:border-color .2s; }
+  .cyc:hover{ border-color:#33507c; }
+  .cyc .cid{ font-size:11px; font-weight:700; letter-spacing:.1em; color:var(--ai); }
+  .cyc .ctot{ float:right; font-size:10px; color:var(--dim); }
+  .cyc .stage{ display:flex; align-items:center; gap:6px; margin-top:5px; font-size:9.5px; }
+  .cyc .stage .nm{ width:64px; color:var(--dim); letter-spacing:.06em; flex:none; }
+  .cyc .stage .bar{ flex:1; height:5px; background:#1a2438; border-radius:3px; overflow:hidden; }
+  .cyc .stage .bar i{ display:block; height:100%; background:var(--ai); border-radius:3px;
+    transition:width .35s ease; }
+  .cyc .stage .bar i.hot{ background:var(--warn); }
+  .cyc .stage .bar i.bad{ background:var(--err); }
+  .cyc .stage .v{ width:52px; text-align:right; color:var(--faint); flex:none; }
+  .cyc .verdict{ margin-top:6px; font-size:9.5px; color:var(--ok); letter-spacing:.04em; }
+  .cyc .verdict.bad{ color:var(--err); }
+  .empty{ color:var(--faint); font-style:italic; padding:14px 4px; font-size:11px; }
+
+  /* ── footer ── */
+  footer{ flex:none; display:flex; gap:16px; padding:6px 16px;
+    border-top:1px solid var(--line); font-size:9.5px; color:var(--faint);
+    letter-spacing:.06em; }
+  footer b{ color:var(--dim); font-weight:600; }
+
+  @media (prefers-reduced-motion: reduce){ .tr, .latbar i{ animation:none !important; transition:none !important; } }
+</style>
+</head>
+<body>
+  <header>
+    <h1 class="display">SENTINEL <i>//</i> TRACE REPLAY</h1>
+    <div class="chips">
+      <span class="chip" id="chipBrain"><i class="dot"></i><span id="chipBrainTxt">backend …</span></span>
+      <span class="chip" id="chipOmni"><i class="dot"></i><span id="chipOmniTxt">omni …</span></span>
+    </div>
+    <div class="spacer"></div>
+    <button id="btnPause" title="freeze the stream (ingestion continues)">❚❚ PAUSE</button>
+    <button id="btnExport" title="download everything as JSON">⇩ EXPORT</button>
+    <button id="btnClear" title="clear the local view (backend buffer untouched)">✕ CLEAR</button>
+    <button id="btnScroll" class="on" title="follow the tail">TAIL ↓</button>
+  </header>
+
+  <section id="omni">
+    <span class="display" id="omniState">OMNI · …</span>
+    <span><span class="lbl">PROVIDER </span><b id="oProv">—</b></span>
+    <span><span class="lbl">MODEL </span><b id="oModel">—</b></span>
+    <span><span class="lbl">ENDPOINT </span><b id="oUrl">—</b></span>
+    <span><span class="lbl">KEY </span><b id="oKey">—</b></span>
+    <span><span class="lbl">CALLS </span><b id="oCalls">0</b></span>
+    <span><span class="lbl">ERRORS </span><b id="oErrs">0</b></span>
+    <span><span class="lbl">P50 </span><span class="latbar"><i id="oP50bar"></i></span><b id="oP50">—</b></span>
+    <span><span class="lbl">LAST </span><span class="latbar"><i id="oLastbar"></i></span><b id="oLast">—</b></span>
+  </section>
+
+  <section id="filters">
+    <span class="fchip on" data-src="all">ALL</span>
+    <span class="fchip" data-src="content">CONTENT</span>
+    <span class="fchip" data-src="backend">BACKEND</span>
+    <span class="fchip" data-src="omni">OMNI</span>
+    <span class="fchip" data-src="sys">SYS</span>
+    <select id="lvl">
+      <option value="all">any level</option>
+      <option value="info">info</option>
+      <option value="warn">warn</option>
+      <option value="error">error</option>
+    </select>
+    <input id="q" type="text" placeholder="filter text — msg, kind, payload keys…">
+    <span id="count">0 events</span>
+  </section>
+
+  <main>
+    <div id="stream"><div class="empty">— waiting for first trace (is the backend up?) —</div></div>
+    <aside id="cycles">
+      <h2>DECISION CYCLES</h2>
+      <div class="empty" id="cycEmpty">no cycles yet — cycles appear when /decide carries a cycle id</div>
+      <div id="cycList"></div>
+    </aside>
+  </main>
+
+  <footer>
+    <span>buffer <b id="fBuf">0/1000</b></span>
+    <span>boot <b id="fBoot">—</b></span>
+    <span>seq <b id="fSeq">0</b></span>
+    <span>poll <b id="fPoll">—</b></span>
+    <span id="fMode" style="margin-left:auto"></span>
+  </footer>
+
+  <script src="debug.js"></script>
+</body>
+</html>
