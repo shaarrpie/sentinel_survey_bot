@@ -71,7 +71,12 @@ class BotState:
 
 
 class IntelligentFormBot:
-    def __init__(self, driver=None):
+    def __init__(self, driver=None, *, allow_mock=False):
+        if driver is None and not allow_mock:
+            raise RuntimeError(
+                "bot_standalone.py is a mock harness. Pass allow_mock=True "
+                "for simulation or provide a real driver adapter."
+            )
         self.driver = driver
         self.state = BotState()
         self.elements: List[FormElement] = []
@@ -271,7 +276,7 @@ class IntelligentFormBot:
 
 
 if __name__ == "__main__":
-    bot = IntelligentFormBot()
+    bot = IntelligentFormBot(allow_mock=True)
     success = bot.run()
     if success:
         print("\n✓ Bot completed form successfully")

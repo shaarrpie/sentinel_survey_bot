@@ -15,7 +15,7 @@ FILES = [
     "backend.py",
     "sentinel_traces.py",
     "bot.py",
-    "bot_standalone.py",
+    "examples/mock_form_bot.py",
     "core.py",
     "main.py",
     "gui.py",

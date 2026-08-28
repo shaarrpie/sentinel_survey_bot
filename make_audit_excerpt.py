@@ -2,7 +2,7 @@
 """Create a truncation-safe Sentinel audit excerpt.
 
 Reads the actual source files directly (no aggregate line-number guessing),
-keeps complete content.js / sentinel_traces.py / bot_standalone.py, and
+keeps complete content.js / sentinel_traces.py / examples/mock_form_bot.py, and
 pulls function-scoped slices of the router-autostart and /decide pipeline.
 
 Usage: python make_audit_excerpt.py
@@ -109,9 +109,9 @@ out.append(
     else "\n# MISSING bot.py router autostart\n"
 )
 
-# ── bot_standalone.py (complete, newer) ───────────────────────────
-sa = lines_of("bot_standalone.py")
-out.append(complete_file("bot_standalone.py", sa))
+# ── examples/mock_form_bot.py (complete, newer) ─────────────────────
+sa = lines_of("examples/mock_form_bot.py")
+out.append(complete_file("examples/mock_form_bot.py", sa))
 
 # ── omni router docs (the only omni source in this workspace) ─────
 docs = lines_of("omniroute_docs.md")

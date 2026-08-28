@@ -33,6 +33,26 @@ class RouterRuntime:
         parsed = urlparse(self.base_url)
         self.host = parsed.hostname or "127.0.0.1"
         self.port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        self._health_cache: dict | None = None
+        self._health_checked_at = 0.0
+
+    def _api_probe(self) -> tuple[bool, str | None]:
+        if not self._port_open():
+            return False, "port closed"
+        try:
+            import httpx
+            headers = {"Authorization": f"Bearer {self.api_key}"} \
+                if self.api_key else {}
+            response = httpx.get(
+                f"{self.base_url}/models",
+                headers=headers,
+                timeout=2.0,
+            )
+            if response.is_success:
+                return True, None
+            return False, f"/models returned HTTP {response.status_code}"
+        except Exception as error:
+            return False, f"{type(error).__name__}: {error}"
 
     def _port_open(self) -> bool:
         try:
@@ -63,8 +83,16 @@ class RouterRuntime:
 
     def start(self, timeout: float = 30.0) -> bool:
         with self._lock:
-            if self._port_open():
+            ready, error = self._api_probe()
+            if ready:
+                self.last_error = None
                 return True
+            if self._port_open():
+                self.last_error = (
+                    f"{self.host}:{self.port} is occupied but router API is unhealthy: "
+                    f"{error}"
+                )
+                return False
             if not self.directory or not self.directory.is_dir():
                 self.last_error = f"router directory missing: {self.directory}"
                 return False
@@ -95,9 +123,11 @@ class RouterRuntime:
                             f"see {log_path}"
                         )
                         return False
-                    if self._port_open():
+                    ready, error = self._api_probe()
+                    if ready:
                         self.last_error = None
                         return True
+                    self.last_error = error
                     time.sleep(0.5)
                 self.last_error = f"router did not open {self.host}:{self.port} in {timeout}s"
                 return False
@@ -115,6 +145,10 @@ class RouterRuntime:
                     self.process.kill()
 
     def health(self) -> dict:
+        now = time.monotonic()
+        if self._health_cache and now - self._health_checked_at < 2.0:
+            return dict(self._health_cache)
+
         port_open = self._port_open()
         api_ready = False
         api_error = None
@@ -133,7 +167,7 @@ class RouterRuntime:
             except Exception as error:
                 api_error = f"{type(error).__name__}: {error}"
 
-        return {
+        result = {
             "configured": bool(self.directory and self.base_url),
             "directory": str(self.directory) if self.directory else None,
             "base_url": self.base_url,
@@ -151,3 +185,6 @@ class RouterRuntime:
             "last_error": self.last_error,
             "mode": "router" if api_ready else "heuristic",
         }
+        self._health_cache = result
+        self._health_checked_at = now
+        return dict(result)

@@ -38,7 +38,7 @@ def is_survey_router_hub(url: str) -> bool:
                for d in get_panel_hub_domains())
 
 class Action(BaseModel):
-    action_type: Literal["click", "type", "select_multi", "scroll", "next", "wait", "human_help"]
+    action_type: Literal["click", "type", "select_option", "select_multi", "scroll", "next", "wait", "human_help"]
     element_id: Optional[int] = Field(None, description="data-bot-id from the element map")
     coordinates: Optional[tuple[int, int]] = Field(None, description="Fallback x,y if element_id fails")
     value: Optional[str] = Field(None, description="Text to type, or option text to select")

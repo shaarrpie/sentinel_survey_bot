@@ -969,6 +969,7 @@ async def learn_rule(req: LearnRequest):
 
 @app.get("/status")
 async def status():
+    router_status = await asyncio.to_thread(router_runtime.health)
     out = {
         "status": "ok",
         "backend_ready": client is not None,
@@ -979,14 +980,17 @@ async def status():
         "sessions": len(MEMORY),
         "rules_count": len(LEARNED_RULES),
     }
-    out.update(bus.snapshot())     # boot_id / uptime / trace_buffer / last_seq / omni
+    bus.set_omni_health(
+        loaded=router_status["api_ready"],
+        model=router_status["model"],
+        base_url=router_status["base_url"],
+        error=router_status["last_error"] or router_status["api_error"],
+        api_key_set=bool(router_runtime.api_key),
+    )
+    out.update(bus.snapshot())
+    out["router"] = router_status
+    out["brain"] = router_status["mode"]
     out["panel_hubs"] = list(get_panel_hub_domains())
-    # r29/r30: real router health — "port open" is not "API answers".
-    out["router"] = router_runtime.health()
-    out["omni"]["loaded"] = out["router"]["api_ready"]
-    out["omni"]["model"] = out["router"]["model"]
-    out["omni"]["base_url"] = out["router"]["base_url"]
-    out["brain"] = out["router"]["mode"]
     return out
 
 # ── omni detail panel (round eleven: live router visibility) ─────

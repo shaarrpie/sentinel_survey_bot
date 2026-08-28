@@ -114,6 +114,16 @@ class TraceBus:
         if len(rc) > 20:
             del rc[: len(rc) - 20]
 
+    def set_omni_health(self, *, loaded, model, base_url, error, api_key_set):
+        with self._lock:
+            self.omni.update({
+                "loaded": bool(loaded),
+                "model": model,
+                "base_url": base_url,
+                "api_key_set": bool(api_key_set),
+                "last_error": error,
+            })
+
     def snapshot(self):
         with self._lock:
             count = len(self._buf)

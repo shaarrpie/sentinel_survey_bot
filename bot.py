@@ -29,6 +29,17 @@ if not os.path.exists("screenshots"):
     os.makedirs("screenshots")
 
 
+def clean_model_text(value: str | None) -> str:
+    text = (value or "").strip()
+    if text.startswith("```json"):
+        text = text[len("```json"):]
+    elif text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    return text.strip()
+
+
 log_filename = f"logs/survey_run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 logging.basicConfig(
     level=logging.INFO,
@@ -347,7 +358,7 @@ class SentinelSurveyBot:
                 temperature=0.4,
                 max_tokens=200
             )
-            rule = response.choices[0].message.content.strip()
+            rule = clean_model_text(response.choices[0].message.content)
             
             if "</think>" in rule:
                 rule = rule.split("</think>")[-1].strip()
@@ -534,15 +545,11 @@ class SentinelSurveyBot:
                 max_tokens=4096
             )
             
-            raw_answer = response.choices[0].message.content.strip()
+            raw_answer = clean_model_text(response.choices[0].message.content)
             
             if "</think>" in raw_answer:
                 raw_answer = raw_answer.split("</think>")[-1].strip()
-            if raw_answer.startswith("```json"):
-                raw_answer = raw_answer.replace("```json", "").replace("```", "").strip()
-            elif raw_answer.startswith("```"):
-                raw_answer = raw_answer.replace("```", "").strip()
-                
+            
             return raw_answer
         except Exception as e:
             logger.error(f"[-] AI Error: {e}")
@@ -771,18 +778,15 @@ class SentinelSurveyBot:
                 
                 if next_btn:
                     self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_btn)
-                    try:
-                        rect = next_btn.rect
-                        cx = int(rect['x'] + rect['width']/2)
-                        cy = int(rect['y'] + rect['height']/2)
-                        self.mouse.click(cx, cy)
-                    except Exception:
+                    rect = next_btn.rect
+                    cx = int(rect['x'] + rect['width'] / 2)
+                    cy = int(rect['y'] + rect['height'] / 2)
+                    clicked = self.mouse.click(
+                        cx, cy, int(rect['width']), int(rect['height'])
+                    )
+                    if not clicked:
                         self.human_mouse_move(next_btn)
-                        time.sleep(random.uniform(0.5, 1.2))
-                        try:
-                            self.actions.move_to_element(next_btn).click().perform()
-                        except Exception:
-                            self.driver.execute_script("arguments[0].click();", next_btn)
+                        self.actions.move_to_element(next_btn).click().perform()
                     logger.info("    [+] Autonomously clicked Next page.")
             except Exception as next_err:
                 logger.debug(f"    [!] Could not click Next button: {next_err}")

@@ -146,75 +146,173 @@ function shouldMapNode(el, view) {
     return isRendered(el, view);
 }
 
-function collectFrameElements(iframeDoc, ioff, elements) {
-    const view = iframeDoc.defaultView;
-    if (!view) return 0;
+function renderedBox(el, view) {
+  if (!el || !el.isConnected) return false;
+  const style = view.getComputedStyle(el);
+  if (style.display === 'none' || style.visibility === 'hidden' ||
+      Number.parseFloat(style.opacity) === 0) return false;
+  if (el.getAttribute('aria-hidden') === 'true') return false;
+  const rect = el.getBoundingClientRect();
+  return rect.width >= 5 && rect.height >= 5;
+}
 
-    const nodes = iframeDoc.querySelectorAll(
-        'button, input, select, textarea, a, [role="button"], [role="radio"], ' +
-        '[role="checkbox"], label, .answer-option, .survey-option, .option, ' +
-        '.choice, [contenteditable]'
-    );
-    let added = 0;
+function isHoneypot(el, view) {
+  if (!['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName)) return false;
+  const rect = el.getBoundingClientRect();
+  const offscreen = rect.bottom < 0 || rect.top > view.innerHeight ||
+    rect.right < 0 || rect.left > view.innerWidth;
+  return offscreen && el.getAttribute('tabindex') === '-1' &&
+    el.getAttribute('autocomplete') === 'off';
+}
 
-    for (const el of nodes) {
-        try {
-            if (!shouldMapNode(el, view)) continue;
+function canonicalNode(el, view) {
+  if (el.tagName === 'INPUT' && el.type === 'hidden') return false;
+  if (isHoneypot(el, view)) return false;
 
-            const control = controlForLabel(el);
-            const stateEl = control || el;
-            const rect = el.getBoundingClientRect();
-            const id = nextId++;
-            const sid = nodeSid(el);
-
-            elRegistry.set(id, el);
-            frameOffsets.set(el, { dx: ioff.left, dy: ioff.top });
-            el.setAttribute('data-sentinel-sid', sid);
-
-            let text = identityText(el);
-            if (!text && control) {
-                text = identityText(control);
-            }
-
-            const entry = {
-                id,
-                sid,
-                frame: true,
-                name: stateEl.getAttribute('name') || '',
-                tag: el.tagName.toLowerCase(),
-                type: stateEl.type || '',
-                text: text.slice(0, 120),
-                option_value: stateEl.value || '',
-                required: !!stateEl.required || stateEl.getAttribute('aria-required') === 'true',
-                disabled: !!stateEl.disabled,
-                x: Math.round(ioff.left + rect.left + rect.width / 2),
-                y: Math.round(ioff.top + rect.top + rect.height / 2)
-            };
-
-            if (stateEl.type === 'radio' || stateEl.type === 'checkbox') {
-                entry.checked = !!stateEl.checked;
-            } else if (el.tagName === 'SELECT') {
-                entry.value = el.value || '';
-                entry.options = [...el.options].map(option => ({
-                    value: option.value,
-                    text: option.text.trim(),
-                    disabled: option.disabled
-                }));
-            } else if (el.isContentEditable) {
-                entry.editable = true;
-                entry.value = (el.textContent || '').trim().slice(0, 200);
-            } else if ('value' in el) {
-                entry.value = String(el.value || '').slice(0, 200);
-            }
-
-            elements.push(entry);
-            added++;
-        } catch (error) {
-            log('warn', 'iframe element skipped:', error && error.message);
-        }
+  if (el.tagName === 'INPUT' &&
+      (el.type === 'radio' || el.type === 'checkbox')) {
+    const label = (el.labels && el.labels[0]) || el.closest('label');
+    if (!renderedBox(el, view) && renderedBox(label, view)) {
+      return false; // visible label is the canonical target
     }
+  }
 
-    return added;
+  if (el.tagName === 'LABEL') {
+    const control = controlForLabel(el);
+    if (!control) return false;
+    if (renderedBox(control, view)) return false; // visible input is canonical
+  }
+
+  return renderedBox(el, view);
+}
+
+function optionText(el, stateEl) {
+  if (el.tagName === 'LABEL') return identityText(el);
+  if (stateEl.type === 'radio' || stateEl.type === 'checkbox') {
+    const label = (stateEl.labels && stateEl.labels[0]) ||
+      stateEl.closest('label');
+    if (label) return identityText(label);
+  }
+  return identityText(el) || identityText(stateEl);
+}
+
+function questionContext(el) {
+  const container = el.closest(
+    'fieldset, [role="group"], [data-question-id], .question, .q, section'
+  );
+  if (!container) return '';
+  return (container.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+}
+
+function collectDocumentElements(doc, offset, frame, elements, census) {
+  const view = doc.defaultView;
+  if (!view) return 0;
+  const before = elements.length;
+  const nodes = doc.querySelectorAll(
+    'button, input, select, textarea, a, [role="button"], [role="radio"], ' +
+    '[role="checkbox"], [role="slider"], label, .answer-option, ' +
+    '.survey-option, .option, .choice, [contenteditable]'
+  );
+
+  for (const el of nodes) {
+    try {
+      if (!canonicalNode(el, view)) {
+        if (census) census.filtered++;
+        continue;
+      }
+
+      const control = controlForLabel(el);
+      const stateEl = control || el;
+      const rect = el.getBoundingClientRect();
+      const sid = nodeSid(el);
+      const id = nextId++;
+      const role = el.getAttribute('role') || '';
+      const semanticType = stateEl.type ||
+        (role === 'radio' || role === 'checkbox' || role === 'range'
+          ? role.replace('range', 'range') : '');
+
+      el.setAttribute('data-sentinel-sid', sid);
+      elRegistry.set(id, el);
+      if (frame) frameOffsets.set(el, { dx: offset.left, dy: offset.top });
+
+      const entry = {
+        id,
+        sid,
+        frame,
+        name: stateEl.getAttribute('name') || '',
+        tag: el.tagName.toLowerCase(),
+        type: semanticType,
+        role,
+        text: optionText(el, stateEl).slice(0, 120),
+        option_value: String(stateEl.value || el.dataset.value || ''),
+        required: !!stateEl.required ||
+          stateEl.getAttribute('aria-required') === 'true',
+        disabled: !!stateEl.disabled ||
+          stateEl.getAttribute('aria-disabled') === 'true',
+        x: Math.round(offset.left + rect.left + rect.width / 2),
+        y: Math.round(offset.top + rect.top + rect.height / 2),
+        context: questionContext(el)
+      };
+
+      if (semanticType === 'radio' || semanticType === 'checkbox') {
+        entry.checked = 'checked' in stateEl
+          ? !!stateEl.checked
+          : stateEl.getAttribute('aria-checked') === 'true';
+      } else if (el.tagName === 'SELECT') {
+        entry.value = el.value || '';
+        entry.options = [...el.options].map(option => ({
+          value: option.value,
+          text: option.text.trim(),
+          disabled: option.disabled
+        }));
+      } else if (el.isContentEditable) {
+        entry.editable = true;
+        entry.value = (el.textContent || '').trim().slice(0, 200);
+      } else if ('value' in stateEl) {
+        entry.value = String(stateEl.value || '').slice(0, 200);
+      }
+
+      if ('min' in stateEl) entry.min = stateEl.min || null;
+      if ('max' in stateEl) entry.max = stateEl.max || null;
+      if ('step' in stateEl) entry.step = stateEl.step || null;
+
+      elements.push(entry);
+    } catch (error) {
+      log('warn', `${frame ? 'iframe' : 'top'} element skipped:`,
+        error && error.message);
+    }
+  }
+
+  return elements.length - before;
+}
+
+function getElementMap() {
+  const elements = [];
+  elRegistry.clear();
+  nextId = 0;
+  const census = { filtered: 0 };
+  collectDocumentElements(
+    document,
+    { left: 0, top: 0 },
+    false,
+    elements,
+    census
+  );
+  lastMapDebug.elements = elements.slice();
+  lastMapDebug.census = census;
+  log('dim', `map: ${elements.length} top element(s), ` +
+    `${census.filtered} filtered`);
+  return elements;
+}
+
+function collectFrameElements(iframeDoc, frameRect, elements) {
+  return collectDocumentElements(
+    iframeDoc,
+    { left: frameRect.left, top: frameRect.top },
+    true,
+    elements,
+    null
+  );
 }
 
 // Tier-2 DOM skeleton: compact live-DOM structure for the AI.
@@ -266,96 +364,6 @@ function isSrOnlyControl(el) {
     return b.width >= 5 && b.height >= 5;   // visible label wrapping a hidden input
 }
 
-function getElementMap() {
-    const elements = [];
-    elRegistry.clear();
-    nextId = 0;
-    const census = { size: 0, hidden: 0, aria: 0, display: 0, honeypot: 0 };
-
-    const all = document.querySelectorAll(
-        'button, input, select, textarea, a, [role="button"], [role="radio"], ' +
-        '[role="checkbox"], label, .answer-option, .survey-option, .option, .choice, [contenteditable]');
-
-    all.forEach((el) => {
-        const cs = getComputedStyle(el);
-        if (cs.display === 'none' || cs.visibility === 'hidden' ||
-            parseFloat(cs.opacity) === 0) { census.display++; return; }
-        if (el.getAttribute('aria-hidden') === 'true') { census.aria++; return; }
-        if (el.tagName === 'INPUT' && el.type === 'hidden') { census.hidden++; return; }
-
-        const ctrl = el.tagName === 'LABEL'
-            ? (el.control || el.querySelector('input[type="radio"],input[type="checkbox"]'))
-            : null;
-        if (ctrl && ctrl !== el && document.contains(ctrl)) {
-            const b = ctrl.getBoundingClientRect();
-            if (b.width >= 5 && b.height >= 5) return;   // visible control: dedupe label
-        }
-
-        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT') {
-            const r = el.getBoundingClientRect();
-            const offscreen = r.bottom < 0 || r.top > window.innerHeight ||
-                              r.right < 0 || r.left > window.innerWidth;
-            if (offscreen && el.getAttribute('tabindex') === '-1' &&
-                el.getAttribute('autocomplete') === 'off') { census.honeypot++; return; }   // honeypot
-        }
-
-        const rect = el.getBoundingClientRect();
-        if (rect.width < 5 || rect.height < 5) {
-            // sr-only / visually-hidden inputs are genuine controls whose label
-            // is the visible UI — exempt them from the 5px minimum (r29).
-            if (!isSrOnlyControl(el)) { census.size++; return; }
-        }
-
-        const id = nextId++;
-        elRegistry.set(id, el);
-        const sid = nodeSid(el);
-        el.setAttribute('data-sentinel-sid', sid);
-
-        let entryText = identityText(el);
-        if (!entryText && (el.type === 'radio' || el.type === 'checkbox' || ctrl)) {
-            const lbl = (el.labels && el.labels[0]) || (el.closest ? el.closest('label') : null);
-            if (lbl) entryText = (lbl.innerText || '').trim();
-        }
-        const text = entryText.substring(0, 120);
-
-        const stateEl = ctrl || el;   // labels answer through their control
-        const entry = {
-            id: id,
-            sid: sid,
-            name: el.getAttribute('name') || (ctrl ? (ctrl.getAttribute('name') || '') : ''),
-            tag: el.tagName.toLowerCase(),
-            type: el.type || (ctrl ? (ctrl.type || '') : ''),
-            text: text,
-            x: Math.round(rect.left + rect.width / 2),
-            y: Math.round(rect.top + rect.height / 2)
-        };
-        if (stateEl.type === 'radio' || stateEl.type === 'checkbox')
-            entry.checked = !!stateEl.checked;
-        if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')
-            entry.value = (el.value || '').substring(0, 40);
-        if (el.tagName === 'SELECT') {
-            const sel = el.selectedOptions && el.selectedOptions[0];
-            entry.value = (sel && sel.value) || '';
-        }
-        if (el.isContentEditable) {
-            entry.editable = true;
-            entry.value = (el.textContent || '').trim().slice(0, 40);
-        }
-        elements.push(entry);
-    });
-
-    lastMapDebug.elements = elements;
-    lastMapDebug.census = census;
-    log('dim', `map: ${elements.length} kept, filtered ` +
-        `[size:${census.size} hidden:${census.hidden} aria:${census.aria} ` +
-        `disp:${census.display} hp:${census.honeypot}]`);
-    return elements;
-}
-
-// ─── Page State ───────────────────────────────────────────────────
-// Structural skeleton instead of raw text: tagName + name + id + checked +
-// value. Live regions (the specimen's own signal rail) no longer reset the
-// fingerprint every cycle, so the stuck-detector actually fires.
 function getFingerprint() {
     const parts = [location.href];
     const hashDoc = (doc, prefix) => {
@@ -948,6 +956,9 @@ async function scan(tabId) {
                 log('warn', 'iframe mapping failed:', e && e.message);
             }
         }
+
+        lastMapDebug.elements = elements.slice();
+        lastMapDebug.frameCount = elements.filter(entry => entry.frame).length;
 
         const dom = domSkeleton();
         const cycleId = `${RUN_ID || 0}-${Date.now().toString(36)}`;

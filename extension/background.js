@@ -1,5 +1,8 @@
-const BACKEND = 'http://127.0.0.1:8000';
-const SENTINEL_TOKEN = '';  // set to your shared secret if backend enforces it
+try { importScripts('config.local.js'); } catch (_) {}
+
+const LOCAL = self.SENTINEL_LOCAL_CONFIG || {};
+const BACKEND = LOCAL.backend || 'http://127.0.0.1:8000';
+const SENTINEL_TOKEN = LOCAL.token || '';
 
 // Single shared matcher for CHECK_PANEL_HUB (tested verbatim by the
 // Node fixture — see extension/hub_match.js header).

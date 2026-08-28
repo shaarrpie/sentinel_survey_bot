@@ -7,7 +7,7 @@ from typing import Any
 
 
 SCREEN_OUT = {"advertising", "market research", "marketing", "mr", "mkt"}
-NONE_WORDS = {"none", "none of the above", "neither", "not applicable"}
+NONE_WORDS = {"none", "none of the above", "no", "neither", "not applicable", "prefer not to say", "don't know", "not sure"}
 NON_TEXT_INPUTS = {"hidden", "button", "submit", "reset", "image", "file"}
 
 
@@ -78,10 +78,10 @@ def heuristic_decide(elements: list[dict[str, Any]], page_text: str = "") -> dic
                 continue
             handled_groups.add(group_key)
             group = groups[group_key]
-            if any(bool(item.get("checked")) for item in group):
-                continue
 
             if input_type == "radio":
+                if any(bool(item.get("checked")) for item in group):
+                    continue
                 pick = choose_radio(group)
                 actions.append({
                     "action_type": "click",
@@ -89,11 +89,27 @@ def heuristic_decide(elements: list[dict[str, Any]], page_text: str = "") -> dic
                     "reasoning": f"answer radio group {group_key}",
                 })
             else:
-                select_all = "select all" in page_text.lower()
-                safe = [g for g in group
-                        if str(g.get("option_value") or g.get("text") or "").strip().lower()
-                        not in NONE_WORDS]
-                picks = safe if select_all else safe[:1]
+                local_context = " ".join(
+                    str(item.get("context") or item.get("text") or "")
+                    for item in group
+                ).lower()
+                select_all = "select all" in local_context or (
+                    len([g for g in groups.values()
+                         if g and g[0].get("type") == "checkbox"]) == 1 and
+                    "select all" in page_text.lower()
+                )
+                safe = [
+                    item for item in group
+                    if str(item.get("option_value") or item.get("text") or "")
+                    .strip().lower() not in NONE_WORDS
+                ]
+                if select_all:
+                    picks = [item for item in safe if not item.get("checked")]
+                else:
+                    if any(bool(item.get("checked")) for item in group):
+                        continue
+                    picks = safe[:1]
+
                 for pick in picks:
                     actions.append({
                         "action_type": "click",
