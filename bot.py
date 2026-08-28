@@ -104,24 +104,17 @@ class MouseController:
             self._mouse_input.x = px
             self._mouse_input.y = py
 
-    def click(self, x, y):
+    def click(self, x, y, width=1, height=1):
+        """Element-scaled jitter CDP click. Returns True on success so the
+        caller can fall back to a synthetic click only when this failed
+        (round 30: old jitter used window dims — could miss small elements
+        by ~80px — and success was never reported)."""
         try:
             self._attach()
-            vp = self.cdp("Browser.getWindowForTarget", {}) or {}
-            bounds = vp.get("bounds", {}) or {}
-            width = bounds.get("width", 1280)
-            height = bounds.get("height", 800)
-            tx = int(x + random.uniform(-0.32, 0.32) * min(width, 260))
-            ty = int(y + random.uniform(-0.32, 0.32) * min(height, 260))
-            self.cdp("Input.dispatchMouseEvent", {
-                "type": "mouseMoved",
-                "x": tx,
-                "y": ty,
-                "button": "none",
-                "duration": 0
-            })
-            self._mouse_input.x = tx
-            self._mouse_input.y = ty
+            jitter_x = random.uniform(-0.25, 0.25) * max(1, width)
+            jitter_y = random.uniform(-0.25, 0.25) * max(1, height)
+            tx = int(x + jitter_x)
+            ty = int(y + jitter_y)
             self.move(tx, ty, duration=random.randint(80, 180))
             self.cdp("Input.dispatchMouseEvent", {
                 "type": "mousePressed",
@@ -137,8 +130,10 @@ class MouseController:
                 "button": "left",
                 "clickCount": 1
             })
+            return True
         except Exception as e:
-            logger.debug(f"[-] CDP click failed: {e}")
+            logger.debug("CDP click failed: %s", e)
+            return False
 
     def human_move_sequence(self, start, end, total_ms=350):
         try:
@@ -665,8 +660,12 @@ class SentinelSurveyBot:
                         rect = opt_el.rect
                         cx = int(rect['x'] + rect['width']/2)
                         cy = int(rect['y'] + rect['height']/2)
-                        self.mouse.click(cx, cy)
+                        clicked = self.mouse.click(cx, cy,
+                                                   int(rect['width']),
+                                                   int(rect['height']))
                     except Exception:
+                        clicked = False
+                    if not clicked:
                         self.human_mouse_move(opt_el)
                         time.sleep(random.uniform(0.3, 0.8))
                         try:

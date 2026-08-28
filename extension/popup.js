@@ -293,27 +293,21 @@ function probeBrain() {
             return;
         }
         const s = resp.data;
-        const o = s.omni || {};
-        const rh = s.router_health;
-        const modelShort = o.model ? String(o.model).split('/').pop() : null;
-        // r29: router-health pulse — "is it the router?" answered at a glance.
-        let pulse;
-        let cls;
+        const router = s.router || {};
+        const model = router.model || (s.omni && s.omni.model) || '?';
+        // r30: honest health — requires router.api_ready, not just HTTP 200.
         if (s.dry_run) {
-            pulse = `brain: DRY (${s.traces} traces)`;
-            cls = 'dry';
-        } else if (rh && rh.port_open) {
-            pulse = 'brain: router' + (modelShort ? ` · ${modelShort}` : '');
-            cls = 'online';
+            pulseEl.className = 'pulse dry';
+            pulseTxt.textContent = `brain: DRY | ${model}`;
+        } else if (router.api_ready) {
+            pulseEl.className = 'pulse online';
+            pulseTxt.textContent = `brain: router | ${model}`;
         } else {
-            pulse = rh
-                ? `brain: heuristic · port ${rh.port} closed`
-                : `brain: online (${s.traces} traces)`;
-            cls = 'offline';
-            if (o.loaded) pulse += ' · omni DOWN';
+            pulseEl.className = 'pulse offline';
+            const reason = router.last_error || router.api_error ||
+                (router.port_open === false ? 'port closed' : 'not ready');
+            pulseTxt.textContent = `brain: heuristic | ${reason}`;
         }
-        pulseEl.className = 'pulse ' + cls;
-        pulseTxt.textContent = pulse;
     });
 }
 

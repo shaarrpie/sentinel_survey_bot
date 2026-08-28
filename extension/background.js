@@ -128,41 +128,99 @@ async function trustedMouseClick(tabId, vp) {
   } catch (err) { return { ok: false, error: String(err) }; }
 }
 
+async function fetchJson(url, options = {}, timeoutMs = 45000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const startedAt = Date.now();
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    const text = await response.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch (error) {
+      throw new Error(`HTTP ${response.status} returned non-JSON: ${text.slice(0, 160)}`);
+    }
+    if (!response.ok) {
+      const detail = data && (data.detail || data.error);
+      throw new Error(`HTTP ${response.status}${detail ? `: ${detail}` : ''}`);
+    }
+    return { data, elapsedMs: Date.now() - startedAt };
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      throw new Error(`backend timeout after ${timeoutMs}ms: ${url}`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// captureVisibleTab grabs the ACTIVE tab in the window, which may not be the
+// tab that requested the screenshot if the user switched tabs mid-scan.
+function captureSenderTab(tab) {
+  return new Promise((resolve, reject) => {
+    if (!tab || tab.id == null || tab.windowId == null) {
+      reject(new Error('capture request has no sender tab'));
+      return;
+    }
+    chrome.tabs.query({ active: true, windowId: tab.windowId }, tabs => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      if (!tabs[0] || tabs[0].id !== tab.id) {
+        reject(new Error('sender tab is no longer active; screenshot deferred'));
+        return;
+      }
+      chrome.tabs.captureVisibleTab(
+        tab.windowId,
+        { format: 'jpeg', quality: 70 },
+        dataUrl => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+          } else {
+            resolve(dataUrl);
+          }
+        }
+      );
+    });
+  });
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'CAPTURE_SCREENSHOT') {
-    const winId = sender.tab ? sender.tab.windowId : null;
+    const senderTab = sender.tab || null;
     // captureVisibleTab is rate-limited (~2/sec) — space captures out
+    const winId = senderTab ? senderTab.windowId : null;
     const gap = 550 - (Date.now() - (lastCaptureAt.get(winId) || 0));
     const shoot = () => {
       lastCaptureAt.set(winId, Date.now());
-      chrome.tabs.captureVisibleTab(winId, { format: 'jpeg', quality: 70 }, (dataUrl) => {
-        if (chrome.runtime.lastError) {
-          sendResponse({ error: chrome.runtime.lastError.message });
-        } else {
-          sendResponse({ screenshot: dataUrl });
-        }
-      });
+      captureSenderTab(senderTab)
+        .then(dataUrl => sendResponse({ screenshot: dataUrl }))
+        .catch(err => sendResponse({ error: err.message }));
     };
     if (gap > 0) setTimeout(shoot, gap); else shoot();
     return true;
   }
 
   if (request.action === 'CALL_BACKEND') {
-    fetch(`${BACKEND}/decide`, {
+    const cycle = request.payload && request.payload.cycle_id;
+    fetchJson(`${BACKEND}/decide`, {
       method: 'POST',
       headers: authHeaders(),
       body: JSON.stringify(request.payload)
-    })
-    .then(r => r.json().then(data => ({ ok: r.ok, status: r.status, data })))
-    .then(({ ok, status, data }) => {
-      if (!ok) {
-        // A 4xx/5xx JSON body must never be mistaken for a decision
-        sendResponse({ error: 'HTTP ' + status, status, data });
-        return;
-      }
-      sendResponse({ data, dryRun: !!(data && data.dry_run) });
-    })
-    .catch(err => sendResponse({ error: err.message }));
+    }, 45000)
+      .then(({ data, elapsedMs }) => sendResponse({
+        data,
+        elapsedMs,
+        cycle,
+        dryRun: !!(data && data.dry_run)
+      }))
+      .catch(error => sendResponse({
+        error: error.message,
+        cycle
+      }));
     return true;
   }
 

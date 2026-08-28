@@ -172,14 +172,21 @@ function probeBrain() {
             return;
         }
         const s = resp.data;
-        pulseEl.className = 'pulse ' + (s.dry_run ? 'dry' : 'online');
-        const o = s.omni || {};
-        const omniTxt = o.loaded
-            ? ` · omni ${o.provider || 'ok'}`
-            : (s.omni ? ' · omni DOWN' : '');
-        pulseTxt.textContent = (s.dry_run
-            ? `brain: DRY (${s.traces} traces)`
-            : `brain: online (${s.traces} traces)`) + omniTxt;
+        const router = s.router || {};
+        const model = router.model || (s.omni && s.omni.model) || '?';
+        // r30: honest health — requires router.api_ready, not just HTTP 200.
+        if (s.dry_run) {
+            pulseEl.className = 'pulse dry';
+            pulseTxt.textContent = `brain: DRY | ${model}`;
+        } else if (router.api_ready) {
+            pulseEl.className = 'pulse online';
+            pulseTxt.textContent = `brain: router | ${model}`;
+        } else {
+            pulseEl.className = 'pulse offline';
+            const reason = router.last_error || router.api_error ||
+                (router.port_open === false ? 'port closed' : 'not ready');
+            pulseTxt.textContent = `brain: heuristic | ${reason}`;
+        }
     });
 }
 

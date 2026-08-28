@@ -1,0 +1,46 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Runtime state
+logs/
+screenshots/
+profiles/
+traces/
+panel_config.json
+answer_cache.json
+sentinel-router.log
+
+# Generated audit/snapshot files
+paste.txt
+project.txt
+full_project_paste.txt
+all_source_codes.txt
+audit_excerpt.txt
+_chk.txt
+_probe*.txt
+_insights_*
+_tractive.js
+_ix*.py
+_hub.py
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,83 +1,108 @@
-"""Runtime-configurable panel hub domains.
+from __future__ import annotations
 
-Single source of truth shared by core.py (Playwright flow) and backend.py
-(extension flow), so the extension popup can add a panel hub link at runtime
-without code changes. Landing on a configured hub means the survey TERMINATED
-the session and bounced back to the panel — the bot must STOP and hand control
-back; it must never fill out a login wall.
-"""
 import json
+import logging
 import os
 import re
+import threading
+from pathlib import Path
 from urllib.parse import urlparse
 
-PANEL_CONFIG_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "panel_config.json")
 
-_domains = ()   # tuple of normalized hosts, e.g. ("panel.example.com",)
+logger = logging.getLogger(__name__)
+PANEL_CONFIG_FILE = Path(__file__).resolve().with_name("panel_config.json")
+_lock = threading.RLock()
+_domains: tuple[str, ...] = ()
+_mtime_ns: int | None = None
 
 
-def _normalize(entry):
-    """Accept a bare domain ('panel.example.com') or a full URL with a path
-    ('https://research.example.com/panel?t=1'); return the bare host."""
-    s = str(entry or "").strip().lower()
-    if not s:
+def _normalize(entry) -> str | None:
+    value = str(entry or "").strip().lower()
+    if not value:
         return None
-    if "://" not in s:
-        s = "http://" + s          # make urlparse treat it as a URL
+    if "://" not in value:
+        value = "http://" + value
     try:
-        host = urlparse(s).netloc or urlparse(s).path.split("/")[0]
-    except Exception:
+        host = (urlparse(value).hostname or "").removeprefix("www.")
+    except ValueError:
         return None
-    host = host.split("@")[-1].split(":")[0]        # strip userinfo + port
-    if host.startswith("www."):
-        host = host[4:]
-    if not re.fullmatch(r"[a-z0-9.-]+", host) or "." not in host:
-        return None                                  # not a plausible domain
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host):
+        return None
+    if "." not in host or ".." in host:
+        return None
     return host
 
 
-def load():
-    global _domains
+def _read_unlocked() -> tuple[str, ...]:
     try:
-        with open(PANEL_CONFIG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        raw = data.get("panel_hub_domains", []) if isinstance(data, dict) else []
-    except Exception:
-        raw = []
-    seen = []
-    for r in raw:
-        h = _normalize(r)
-        if h and h not in seen:
-            seen.append(h)
-    _domains = tuple(seen)
-    return _domains
+        data = json.loads(PANEL_CONFIG_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ()
+    except Exception as error:
+        logger.error("Failed reading %s: %s", PANEL_CONFIG_FILE, error)
+        return _domains
+    raw = data.get("panel_hub_domains", []) if isinstance(data, dict) else []
+    return tuple(dict.fromkeys(filter(None, (_normalize(x) for x in raw))))
 
 
-def save():
+def load() -> tuple[str, ...]:
+    global _domains, _mtime_ns
+    with _lock:
+        _domains = _read_unlocked()
+        try:
+            _mtime_ns = PANEL_CONFIG_FILE.stat().st_mtime_ns
+        except FileNotFoundError:
+            _mtime_ns = None
+        return _domains
+
+
+def save() -> None:
+    """Atomic re-save of the current in-memory domains (round 30)."""
+    with _lock:
+        temp = PANEL_CONFIG_FILE.with_suffix(".json.tmp")
+        temp.write_text(
+            json.dumps({"panel_hub_domains": list(_domains)}, indent=2),
+            encoding="utf-8")
+        os.replace(temp, PANEL_CONFIG_FILE)
+        try:
+            _set_mtime()
+        except Exception:
+            pass
+
+
+def _set_mtime() -> None:
+    global _mtime_ns
     try:
-        with open(PANEL_CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump({"panel_hub_domains": list(_domains)}, f, indent=2)
-    except Exception:
-        pass
+        _mtime_ns = PANEL_CONFIG_FILE.stat().st_mtime_ns
+    except FileNotFoundError:
+        _mtime_ns = None
 
 
-def get_panel_hub_domains():
-    return _domains
+def get_panel_hub_domains() -> tuple[str, ...]:
+    global _mtime_ns
+    with _lock:
+        try:
+            current = PANEL_CONFIG_FILE.stat().st_mtime_ns
+        except FileNotFoundError:
+            current = None
+        if current != _mtime_ns:
+            return load()   # another process edited the file — pick it up live
+        return _domains
 
 
-def set_panel_hub_domains(entries):
-    """Replace the whole list from URLs or bare domains (deduped).
-    Returns the normalized tuple."""
+def set_panel_hub_domains(entries) -> tuple[str, ...]:
     global _domains
-    seen = []
-    for e in entries or []:
-        h = _normalize(e)
-        if h and h not in seen:
-            seen.append(h)
-    _domains = tuple(seen)
-    save()
-    return _domains
+    normalized = tuple(dict.fromkeys(
+        filter(None, (_normalize(x) for x in entries or []))))
+    payload = json.dumps({"panel_hub_domains": list(normalized)}, indent=2)
+    with _lock:
+        temp = PANEL_CONFIG_FILE.with_suffix(".json.tmp")
+        temp.write_text(payload, encoding="utf-8")
+        os.replace(temp, PANEL_CONFIG_FILE)   # atomic swap
+        _domains = normalized
+        _set_mtime()
+        return _domains
 
 
 load()
+

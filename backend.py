@@ -32,46 +32,36 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
+import asyncio
+from contextlib import asynccontextmanager
 
-# ── proxy auto-start (mirrors bot.py) ───────────────────────────────
+from router_runtime import RouterRuntime
+
+router_runtime = RouterRuntime(
+    directory=os.getenv("FREELLM_DIR", ""),
+    base_url=os.getenv("BASE_URL", "http://127.0.0.1:20128/v1"),
+    api_key=os.getenv("API_KEY", "") or os.getenv("FREELLMAPI_KEY", ""),
+    model=os.getenv("MODEL_NAME", "auto/best-chat"),
+    npm_script=os.getenv("OMNI_ROUTER_SCRIPT", "dev"),
+)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    started = await asyncio.to_thread(router_runtime.start)
+    if not started:
+        logger.error("[!] Router runtime: %s — heuristic-only mode",
+                     router_runtime.last_error)
+    yield
+    await asyncio.to_thread(router_runtime.stop)
+
+
+app = FastAPI(lifespan=lifespan)
+
 def is_port_in_use(port):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(('127.0.0.1', port)) == 0
 
-def _ensure_omni_router():
-    free_llm_dir = os.getenv("FREELLM_DIR", "")
-    base_url = os.getenv("BASE_URL", "http://127.0.0.1:20128/v1")
-    proxy_port = 3001 if ":3001" in base_url else 20128
-    if not free_llm_dir or is_port_in_use(proxy_port):
-        if is_port_in_use(proxy_port):
-            logger.info(f"[+] Omni router already on port {proxy_port}")
-        return
-    logger.info(f"[*] Omni router not on port {proxy_port}. Starting from FREELLM_DIR={free_llm_dir}...")
-    try:
-        # Windows: `npm` resolves to a .cmd shim, and Popen(..., shell=False)
-        # can't launch a .cmd through CreateProcess — it dies with
-        # FileNotFoundError [WinError 2]. Use npm.cmd on Windows (round 29).
-        npm = shutil.which("npm") or ("npm.cmd" if os.name == "nt" else "npm")
-        proc = subprocess.Popen(
-            [npm, "run", "dev"], cwd=free_llm_dir, shell=False,
-            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
-        )
-        logger.info(f"[+] Spawned router PID {proc.pid}, waiting for port {proxy_port}...")
-        for _ in range(30):
-            if is_port_in_use(proxy_port):
-                logger.info("[+] Router is online")
-                time.sleep(2)
-                return
-            time.sleep(1)
-        logger.warning("[!] Router start timeout — proceeding anyway")
-    except Exception as e:
-        logger.error(f"[-] Router autostart failed: {e}")
-        logger.error("[!] Entering heuristic-only mode — no LLM decisions.")
-        logger.error("[!] Manual start required:  cd %s && npm run dev  (or npx omniroute)",
-                     free_llm_dir)
-
-_ensure_omni_router()
 
 # ── trace bus (round two): ring buffer + /traces poll endpoint ──
 from sentinel_traces import bus, omni_call, probe_omni  # noqa: E402
@@ -991,14 +981,12 @@ async def status():
     }
     out.update(bus.snapshot())     # boot_id / uptime / trace_buffer / last_seq / omni
     out["panel_hubs"] = list(get_panel_hub_domains())
-    # r29: router health so the popup answers "is it the router at a glance".
-    proxy_port = 3001 if ":3001" in BASE_URL else 20128
-    out["router_health"] = {
-        "port": proxy_port,
-        "port_open": is_port_in_use(proxy_port),
-        "free_llm_dir": bool(os.getenv("FREELLM_DIR", "")),
-        "base_url": BASE_URL,
-    }
+    # r29/r30: real router health — "port open" is not "API answers".
+    out["router"] = router_runtime.health()
+    out["omni"]["loaded"] = out["router"]["api_ready"]
+    out["omni"]["model"] = out["router"]["model"]
+    out["omni"]["base_url"] = out["router"]["base_url"]
+    out["brain"] = out["router"]["mode"]
     return out
 
 # ── omni detail panel (round eleven: live router visibility) ─────

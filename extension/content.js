@@ -106,73 +106,114 @@ function identityText(el) {
     return (inner || aria || ph || val || tc).trim();
 }
 
-// Unified same-origin iframe collector (audit r25): one frame-traversal
-// function used by scan(), with per-element guards and loud counts.
+// Unified same-origin iframe collector (audit r25, canonical targets r30):
+// visible control -> map the control; hidden control + visible label ->
+// map the label as the pseudo-control and inherit its state.
+function controlForLabel(el) {
+    if (!el || el.tagName !== 'LABEL') return null;
+    return el.control || el.querySelector(
+        'input[type="radio"], input[type="checkbox"]'
+    );
+}
+
+function isRendered(el, view) {
+    if (!el || !el.isConnected) return false;
+    const cs = view.getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden' ||
+        Number.parseFloat(cs.opacity) === 0) return false;
+    if (el.getAttribute('aria-hidden') === 'true') return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width >= 5 && rect.height >= 5;
+}
+
+function shouldMapNode(el, view) {
+    if (el.tagName === 'INPUT' && el.type === 'hidden') return false;
+
+    if (el.tagName === 'INPUT' &&
+        (el.type === 'radio' || el.type === 'checkbox')) {
+        const label = (el.labels && el.labels[0]) || el.closest('label');
+        if (!isRendered(el, view) && isRendered(label, view)) {
+            return false; // visible label will be the one canonical click target
+        }
+    }
+
+    if (el.tagName === 'LABEL') {
+        const control = controlForLabel(el);
+        if (!control) return false; // plain labels are not actionable
+        if (isRendered(control, view)) return false; // visible input is canonical
+    }
+
+    return isRendered(el, view);
+}
+
 function collectFrameElements(iframeDoc, ioff, elements) {
-    const dv = iframeDoc.defaultView;
-    const els = iframeDoc.querySelectorAll(
+    const view = iframeDoc.defaultView;
+    if (!view) return 0;
+
+    const nodes = iframeDoc.querySelectorAll(
         'button, input, select, textarea, a, [role="button"], [role="radio"], ' +
         '[role="checkbox"], label, .answer-option, .survey-option, .option, ' +
-        '.choice, [contenteditable]');
+        '.choice, [contenteditable]'
+    );
     let added = 0;
-    els.forEach((el) => {
-        try {                                    // per-element: one bad node
-            const cs = dv ? dv.getComputedStyle(el) : getComputedStyle(el);
-            if (cs.display === 'none' || cs.visibility === 'hidden' ||
-                parseFloat(cs.opacity) === 0) return;
-            if (el.getAttribute('aria-hidden') === 'true') return;
-            if (el.tagName === 'INPUT' && el.type === 'hidden') return;
-            const rect = el.getBoundingClientRect();
-            if (rect.width < 5 || rect.height < 5) return;
 
+    for (const el of nodes) {
+        try {
+            if (!shouldMapNode(el, view)) continue;
+
+            const control = controlForLabel(el);
+            const stateEl = control || el;
+            const rect = el.getBoundingClientRect();
             const id = nextId++;
+            const sid = nodeSid(el);
+
             elRegistry.set(id, el);
             frameOffsets.set(el, { dx: ioff.left, dy: ioff.top });
-
-            const ctrl = el.tagName === 'LABEL'
-                ? (el.control || el.querySelector('input[type="radio"],input[type="checkbox"]'))
-                : null;
-            if (ctrl && ctrl !== el && ctrl.getBoundingClientRect().width >= 5) return;
-
-            const sid = nodeSid(el);
             el.setAttribute('data-sentinel-sid', sid);
 
-            let txt = identityText(el);
-            if (!txt && (el.type === 'radio' || el.type === 'checkbox' || ctrl)) {
-                const lbl = (el.labels && el.labels[0]) || (el.closest ? el.closest('label') : null);
-                if (lbl) txt = (lbl.innerText || '').trim();
+            let text = identityText(el);
+            if (!text && control) {
+                text = identityText(control);
             }
 
-            const stateEl = ctrl || el;
-            const ientry = {
-                id: id,
-                sid: sid,
+            const entry = {
+                id,
+                sid,
                 frame: true,
-                name: el.getAttribute('name') || (ctrl ? (ctrl.getAttribute('name') || '') : ''),
+                name: stateEl.getAttribute('name') || '',
                 tag: el.tagName.toLowerCase(),
-                type: el.type || (ctrl ? (ctrl.type || '') : ''),
-                text: txt.substring(0, 120),
+                type: stateEl.type || '',
+                text: text.slice(0, 120),
+                option_value: stateEl.value || '',
+                required: !!stateEl.required || stateEl.getAttribute('aria-required') === 'true',
+                disabled: !!stateEl.disabled,
                 x: Math.round(ioff.left + rect.left + rect.width / 2),
                 y: Math.round(ioff.top + rect.top + rect.height / 2)
             };
-            if (stateEl.type === 'radio' || stateEl.type === 'checkbox')
-                ientry.checked = !!stateEl.checked;
-            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA')
-                ientry.value = (el.value || '').substring(0, 40);
-            if (el.tagName === 'SELECT') {
-                const sel = el.selectedOptions && el.selectedOptions[0];
-                ientry.value = (sel && sel.value) || '';
+
+            if (stateEl.type === 'radio' || stateEl.type === 'checkbox') {
+                entry.checked = !!stateEl.checked;
+            } else if (el.tagName === 'SELECT') {
+                entry.value = el.value || '';
+                entry.options = [...el.options].map(option => ({
+                    value: option.value,
+                    text: option.text.trim(),
+                    disabled: option.disabled
+                }));
+            } else if (el.isContentEditable) {
+                entry.editable = true;
+                entry.value = (el.textContent || '').trim().slice(0, 200);
+            } else if ('value' in el) {
+                entry.value = String(el.value || '').slice(0, 200);
             }
-            if (el.isContentEditable) {
-                ientry.editable = true;
-                ientry.value = (el.textContent || '').trim().slice(0, 40);
-            }
-            elements.push(ientry);
+
+            elements.push(entry);
             added++;
-        } catch (err) {
-            log('warn', 'iframe element skipped:', err && err.message);
+        } catch (error) {
+            log('warn', 'iframe element skipped:', error && error.message);
         }
-    });
+    }
+
     return added;
 }
 
@@ -909,11 +950,13 @@ async function scan(tabId) {
         }
 
         const dom = domSkeleton();
+        const cycleId = `${RUN_ID || 0}-${Date.now().toString(36)}`;
 
         const backendResp = await new Promise(resolve => {
             chrome.runtime.sendMessage({
                 action: 'CALL_BACKEND',
                 payload: {
+                    cycle_id: cycleId,
                     session_id: `${tabId}-${RUN_ID || 0}`,
                     screenshot_b64: screenshotB64,
                     elements: elements,
@@ -928,6 +971,7 @@ async function scan(tabId) {
             log('err', 'Backend error:', backendResp ? backendResp.error : 'no response');
             return;
         }
+        log('dim', `backend cycle ${cycleId}: ${backendResp.elapsedMs || '?'}ms`);
 
         const decision = backendResp.data;
         if (!decision || !Array.isArray(decision.actions)) {

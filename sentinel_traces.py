@@ -7,6 +7,7 @@ Sentinel trace bus.
 - snapshot() — merge into your existing /status response.
 Framework-agnostic core; FastAPI wiring at the bottom.
 """
+import copy
 import itertools
 import threading
 import time
@@ -115,15 +116,16 @@ class TraceBus:
 
     def snapshot(self):
         with self._lock:
-            n = len(self._buf)
+            count = len(self._buf)
             last = self._buf[-1]["seq"] if self._buf else 0
+            omni = copy.deepcopy(self.omni)   # nested mutables — copy under lock
         return {
             "boot_id": self.boot_id,
             "started_at": self.started_at,
             "uptime_s": round(time.time() - self.started_at, 1),
-            "trace_buffer": n,
+            "trace_buffer": count,
             "last_seq": last,
-            "omni": dict(self.omni),
+            "omni": omni,
         }
 bus = TraceBus()
 
@@ -196,13 +198,27 @@ async def traces(since: int = 0):
 
 async def trace_middleware(request: Request, call_next):
     # Auto-instrument every backend route EXCEPT the poll endpoint itself.
+    # Exceptions from call_next are recorded too, then re-raised (round 30).
     if request.url.path == "/traces":
         return await call_next(request)
-    t0 = time.time()
-    resp = await call_next(request)
-    ms = (time.time() - t0) * 1000
-    bus.record("backend", "http",
-               f"{request.method} {request.url.path} -> {resp.status_code}",
-               {"path": request.url.path, "status": resp.status_code},
-               level="warn" if resp.status_code >= 400 else "info", ms=ms)
-    return resp
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception as error:
+        elapsed = (time.perf_counter() - started) * 1000
+        bus.record(
+            "backend", "http_error",
+            f"{request.method} {request.url.path} raised {type(error).__name__}",
+            {"path": request.url.path, "error": str(error)},
+            level="error", ms=elapsed,
+        )
+        raise
+    elapsed = (time.perf_counter() - started) * 1000
+    bus.record(
+        "backend", "http",
+        f"{request.method} {request.url.path} -> {response.status_code}",
+        {"path": request.url.path, "status": response.status_code},
+        level="warn" if response.status_code >= 400 else "info",
+        ms=elapsed,
+    )
+    return response
