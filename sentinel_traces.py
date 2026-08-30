@@ -181,10 +181,7 @@ def probe_omni(router_obj=None):
     """Call once at startup with your omni router instance. Adapts to
     common shapes: .status(), .provider/.model attrs, or a plain dict."""
     with bus._lock:
-<<<<<<< HEAD
         o = bus.omni
-=======
->>>>>>> 846183fcceca5d0c29408646468b7241a76ccca7
         try:
             if router_obj is None:
                 raise RuntimeError("no router instance passed to probe_omni()")
@@ -192,7 +189,6 @@ def probe_omni(router_obj=None):
             if isinstance(router_obj, dict):
                 info = router_obj
             info = info or {}
-<<<<<<< HEAD
             o["loaded"] = True
             o["provider"] = info.get("provider") or getattr(router_obj, "provider", None)
             o["model"] = info.get("model") or getattr(router_obj, "model", None)
@@ -203,29 +199,6 @@ def probe_omni(router_obj=None):
             o["loaded"] = False
             o["last_error"] = f"probe failed: {e}"
         o = copy.deepcopy(bus.omni)   # for the record below, out of the lock
-=======
-            provider = info.get("provider") or getattr(router_obj, "provider", None)
-            model = info.get("model") or getattr(router_obj, "model", None)
-            base_url = info.get("base_url") or getattr(router_obj, "base_url", None)
-            api_key_set = bool(info.get("api_key_set",
-                                        getattr(router_obj, "api_key", None)))
-            # Was: o["loaded"] = True unconditionally — so /status'
-            # omni.loaded meant "we called probe once", not "the provider
-            # works". Now it means the router is actually wired
-            # (endpoint + key); /status overwrites it with live
-            # api_ready on every poll anyway.
-            loaded = bool(base_url and api_key_set)
-            bus.omni.update({
-                "loaded": loaded,
-                "provider": provider,
-                "model": model,
-                "base_url": base_url,
-                "api_key_set": api_key_set,
-            })
-        except Exception as e:
-            bus.omni["loaded"] = False
-            bus.omni["last_error"] = f"probe failed: {e}"
->>>>>>> 846183fcceca5d0c29408646468b7241a76ccca7
     bus.record("sys", "state",
                f"omni router {'LOADED' if o['loaded'] else 'NOT LOADED'}"
                + (f" — {o['provider']}/{o['model']}" if o["loaded"] else ""),
