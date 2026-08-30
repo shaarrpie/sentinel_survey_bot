@@ -23,15 +23,28 @@ echo.
 echo [+] Backend:  http://127.0.0.1:8000
 echo [+] OmniRoute: http://localhost:20128/v1
 echo.
-echo Opening Chrome with Sentinel extension...
-start chrome
+
+rem The old launcher ran bare "start chrome" — no extension loaded, and
+rem "close this window to stop" killed nothing. Now Chrome gets a dedicated
+rem profile + the extension, and both child processes are reaped on exit.
+set "CHROME_PROFILE=%TEMP%\sentinel_chrome_profile"
+echo Opening Chrome with the Sentinel extension (dedicated profile)...
+start "Sentinel Chrome" chrome --user-data-dir="%CHROME_PROFILE%" --load-extension="%~dp0extension" --new-window
 
 echo.
 echo ============================================
 echo   All systems launched.
-echo   Close this window to stop monitoring.
+echo   Closing this window stops the backend and
+echo   OmniRoute (the Sentinel Chrome window stays
+echo   open — close it manually).
 echo ============================================
 pause
+
+:cleanup
+echo [~] Stopping backend and OmniRoute...
+taskkill /f /fi "WINDOWTITLE eq Sentinel Backend*" >nul 2>&1
+taskkill /f /fi "WINDOWTITLE eq Sentinel OmniRoute*" >nul 2>&1
+taskkill /f /im uvicorn.exe >nul 2>&1
 exit /b 0
 
 :wait_for

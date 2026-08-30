@@ -48,3 +48,9 @@ npm-debug.log*
 .idea/
 .DS_Store
 Thumbs.db
+
+# Real participant data — never committed
+answer_store.json
+learned_rules.json
+debug_stuck_*.png
+cache/*_answers.json

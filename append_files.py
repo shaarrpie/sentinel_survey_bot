@@ -1,6 +1,6 @@
 import os
 
-root = r'C:\Users\tiajungba\.gemini\antigravity-ide\scratch\sentinel_survey_bot'
+root = os.path.dirname(os.path.abspath(__file__))
 paste_path = os.path.join(root, 'full_project_paste.txt')
 
 # Files to append

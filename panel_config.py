@@ -67,7 +67,7 @@ def save() -> None:
         try:
             _set_mtime()
         except Exception:
-            pass
+            logger.debug("swallowed exception in panel_config.py", exc_info=True)
 
 
 def _set_mtime() -> None:
@@ -102,6 +102,42 @@ def set_panel_hub_domains(entries) -> tuple[str, ...]:
         _domains = normalized
         _set_mtime()
         return _domains
+
+
+def extract_host(url: str) -> str:
+    """Scheme-tolerant host extraction (bare "domain/path" included).
+
+    Returns lowercase hostname with leading "www." and any trailing dot
+    stripped, or "" when unparseable. Semantics mirror hubNormalizeHost in
+    extension/hub_match.js — both are asserted by the shared test tables,
+    keep them in lockstep. Python is deliberately a bit more permissive on
+    scheme-less input (treats it as http://) because the one thing this
+    matcher must never do is let a login wall through.
+    """
+    try:
+        raw = str(url or "").strip().lower()
+        if not raw:
+            return ""
+        if "://" not in raw:
+            raw = "http://" + raw
+        host = urlparse(raw).hostname or ""
+    except (ValueError, AttributeError):
+        return ""
+    host = host.rstrip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def host_matches_hubs(url: str) -> bool:
+    """Dot-guarded hub match: exact apex or *.hub — never a bare suffix, so
+    evilexample.com never hits hub example.com. Trailing-dot FQDNs
+    (panel.example.com.) are stripped first."""
+    host = extract_host(url)
+    if not host:
+        return False
+    return any(host == d or host.endswith("." + d)
+               for d in get_panel_hub_domains())
 
 
 load()

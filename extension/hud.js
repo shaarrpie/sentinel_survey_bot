@@ -127,19 +127,40 @@ function targetTab(cb) {
 }
 
 startBtn.addEventListener('click', () => {
-    targetTab((tab) => {
+    targetTab(async (tab) => {
         if (!tab || !/^https?:/.test(tab.url || '')) {
             flashState('NO HTTPS TAB');
             return;
         }
         const newRunId = Date.now();
-        chrome.tabs.sendMessage(tab.id, { action: 'START', runId: newRunId }, (ack) => {
-            void chrome.runtime.lastError;
-            chrome.runtime.sendMessage({
-                action: 'SET_RUN_STATE', running: true, tabId: tab.id,
-                runId: newRunId, build: (ack && ack.build) || null   // R7-A
+        const sendStart = () => new Promise((resolve) => {
+            chrome.tabs.sendMessage(tab.id, { action: 'START', runId: newRunId }, (ack) => {
+                void chrome.runtime.lastError;
+                resolve(ack || null);
             });
         });
+        let ack = await sendStart();
+        if (!ack) {
+            // No static content script anymore — inject via the scripting
+            // API and ask again before claiming the run is live (the popup
+            // has done this all along; the HUD used to mark RUNNING on a
+            // null ack, leaving a ghost run).
+            try {
+                await chrome.scripting.executeScript({
+                    target: { tabId: tab.id },
+                    files: ['content.js']
+                });
+            } catch (e) { /* restricted page — fall through */ }
+            ack = await sendStart();
+        }
+        chrome.runtime.sendMessage({
+            action: 'SET_RUN_STATE',
+            running: !!ack,
+            tabId: ack ? tab.id : null,
+            runId: ack ? newRunId : null,
+            build: (ack && ack.build) || null     // R7-A
+        });
+        if (!ack) flashState('NO CONTENT SCRIPT');
         refresh();
     });
 });

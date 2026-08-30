@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
-PROFILE_PATH = Path("profile.json")
-ANSWER_STORE_PATH = Path("answer_store.json")
+logger = logging.getLogger(__name__)
+
+_HERE = Path(__file__).resolve().parent
+# Anchored to this file, not the CWD — launching from a different directory
+# used to make the profile silently vanish into the "no profile" persona.
+PROFILE_PATH = _HERE / "profile.json"
+ANSWER_STORE_PATH = _HERE / "answer_store.json"
 
 PARTICIPATION_RULES = """PARTICIPATION RULES:
  1. ACCURACY & CONSISTENCY: Keep the profile complete, accurate, and consistent across studies. Never change demographics or traits to chase a study.
@@ -73,6 +79,7 @@ def load_answer_store() -> dict:
         data = json.loads(ANSWER_STORE_PATH.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:
+        logger.warning("could not load answer store — starting empty", exc_info=True)
         return {}
 
 
@@ -83,7 +90,7 @@ def save_answer(question_text: str, answer_text: str) -> None:
     try:
         ANSWER_STORE_PATH.write_text(json.dumps(store, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception:
-        pass
+        logger.warning("could not persist answer store", exc_info=True)
 
 
 def get_cached_answer(question_text: str) -> str | None:

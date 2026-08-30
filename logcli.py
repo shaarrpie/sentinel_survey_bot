@@ -1,5 +1,8 @@
+import logging
 import os
 import sys
+
+logger = logging.getLogger(__name__)
 import glob
 import argparse
 import time
@@ -78,7 +81,7 @@ def search(keyword, latest_only=True, n=20):
                         if found >= n:
                             return
         except Exception:
-            pass
+            logger.debug("swallowed exception in logcli.py", exc_info=True)
     if found == 0:
         print("No matches.")
 

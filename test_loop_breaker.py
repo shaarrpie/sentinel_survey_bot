@@ -1,7 +1,18 @@
 """Round-three loop-breaker proof: drives /decide through both phases of the
-prison scenario and asserts the bot now progresses instead of looping."""
-import base64, io, sys
-sys.path.insert(0, r"c:\Users\tiajungba\.gemini\antigravity-ide\scratch\sentinel_survey_bot")
+prison scenario and asserts the bot now progresses instead of looping.
+
+Run from the repo root:  python test_loop_breaker.py
+"""
+import base64
+import io
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# The backend refuses to boot without a token (fail-closed auth) and /decide
+# requires the header — set both before importing.
+os.environ.setdefault("SENTINEL_TOKEN", "loop-test-token")
 
 from PIL import Image
 import backend
@@ -12,6 +23,8 @@ from fastapi.testclient import TestClient
 img = Image.new("RGB", (4, 4), (20, 24, 32))
 buf = io.BytesIO(); img.save(buf, "JPEG", quality=70)
 B64 = base64.b64encode(buf.getvalue()).decode()
+
+AUTH = {"X-Sentinel-Token": os.environ["SENTINEL_TOKEN"]}
 
 def payload(checked):
     return {
@@ -35,14 +48,23 @@ def check(name, cond, detail=""):
     if not cond:
         failures.append(name)
 
+# Auth: no header -> 401 on /decide, /status stays public
 with TestClient(backend.app) as c:
-    r1 = c.post("/decide", json=payload(False)).json()
+    r = c.post("/decide", json=payload(False))
+    check("auth: /decide without token -> 401", r.status_code == 401, r.status_code)
+    r = c.get("/status")
+    check("auth: /status stays public", r.status_code == 200, r.status_code)
+    r = c.get("/debug/last", headers=AUTH)
+    check("debug: /debug/last gated off by default", r.status_code == 404, r.status_code)
+
+    r1 = c.post("/decide", json=payload(False), headers=AUTH).json()
     check("phase1: unanswered -> click", r1["actions"] and
           r1["actions"][0]["action_type"] == "click", r1["actions"])
-    check("phase1: honest confidence 0.2", abs(r1["confidence"] - 0.2) < 1e-6,
+    # heuristic_decide reports 0.4 confidence for an action-producing page
+    check("phase1: heuristic confidence 0.4", abs(r1["confidence"] - 0.4) < 1e-6,
           r1["confidence"])
 
-    r2 = c.post("/decide", json=payload(True)).json()
+    r2 = c.post("/decide", json=payload(True), headers=AUTH).json()
     check("phase2: answered -> next (LOOP BROKEN)",
           r2["actions"] and r2["actions"][0]["action_type"] == "next",
           r2["actions"])
