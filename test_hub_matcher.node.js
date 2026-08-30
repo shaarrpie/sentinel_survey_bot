@@ -23,6 +23,7 @@ const TABLE = [
     ['example.com', '', false],                                       // empty URL never matches
     ['example.com', 'not a url at all', false],
     ['', 'https://example.com/', false],                              // no hubs configured → no hit
+    ['example.com', 'https://app.example.com./x', true],       // trailing-dot FQDN
 ];
 
 let failures = 0;

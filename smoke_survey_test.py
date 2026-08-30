@@ -12,7 +12,8 @@ run, mirroring how Sentinel's two paths behave), and asserts:
 import threading, functools
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
-ROOT = r"c:\Users\tiajungba\.gemini\antigravity-ide\scratch\sentinel_survey_bot"
+import os
+ROOT = os.path.dirname(os.path.abspath(__file__))
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
@@ -144,7 +145,8 @@ with sync_playwright() as pw:
     check("DQ overlay toggles",
           page.evaluate("() => { document.querySelector('#dqBtn').click(); return document.querySelector('#dq').classList.contains('on'); }"))
 
-    page.screenshot(path=ROOT + r"\screenshots\specimen_scorecard.png", full_page=True)
+    os.makedirs(os.path.join(ROOT, "screenshots"), exist_ok=True)
+    page.screenshot(path=os.path.join(ROOT, "screenshots", "specimen_scorecard.png"), full_page=True)
     browser.close()
 
 srv.shutdown()

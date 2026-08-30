@@ -1,5 +1,7 @@
+import asyncio
 import base64
-import html
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -8,6 +10,7 @@ import re
 import time
 import urllib.parse
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Literal
@@ -22,15 +25,11 @@ from pydantic import BaseModel, Field
 from openai import OpenAI, APITimeoutError
 from PIL import Image
 
-try:
-    from backend.sentinel_heuristic import heuristic_decide
-except Exception:
-    heuristic_decide = None
+# Local module now that the backend/ package name collision is gone.
+# No guard: if this import fails, the server is broken and should say so.
+from sentinel_heuristic import heuristic_decide, real_input_kind
 
 logger = logging.getLogger(__name__)
-
-import asyncio
-from contextlib import asynccontextmanager
 
 from provider_health import ProviderHealth
 
@@ -38,6 +37,9 @@ from provider_health import ProviderHealth
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 API_KEY = os.getenv("API_KEY", "")
 MODEL_NAME = os.getenv("MODEL_NAME", "")
+AUTH_TOKEN = os.getenv("SENTINEL_TOKEN", "")
+DEBUG_ON = os.getenv("SENTINEL_DEBUG", "0") == "1"
+EXTENSION_ID = os.getenv("SENTINEL_EXTENSION_ID", "").strip()
 
 provider_health = ProviderHealth(
     base_url=BASE_URL,
@@ -48,6 +50,16 @@ provider_health = ProviderHealth(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Fail closed: without a token every /decide, /learn and /config
+    # request is open to anything on this machine that can reach 8000.
+    if not AUTH_TOKEN:
+        raise SystemExit(
+            "[!] SENTINEL_TOKEN is not set — refusing to start. Put a long "
+            "random secret in .env (see .env.example) and mirror it into "
+            "extension/config.local.js."
+        )
+    if not API_KEY:
+        logger.error("[!] API_KEY missing — running heuristic-only; the model path is dead until it is set")
     status = await asyncio.to_thread(provider_health.health, True)
     if status["api_ready"]:
         logger.info(
@@ -69,125 +81,46 @@ app = FastAPI(lifespan=lifespan)
 from sentinel_traces import bus, omni_call, probe_omni  # noqa: E402
 from sentinel_traces import router as trace_router      # noqa: E402
 from sentinel_traces import trace_middleware            # noqa: E402
-from panel_config import get_panel_hub_domains, set_panel_hub_domains
+from panel_config import (get_panel_hub_domains, set_panel_hub_domains,
+                          host_matches_hubs)
 app.include_router(trace_router)
 app.middleware("http")(trace_middleware)
 
-AUTH_TOKEN = os.getenv("SENTINEL_TOKEN", "")
-
 # ── trace template ───────────────────────────────────────────────
-# NOTE: this string must live at MODULE LEVEL in backend.py (it is
-# referenced by _save_trace). Keep it above _save_trace, exactly
-# as shown — the __PAYLOAD__ token is replaced per trace.
-
-TRACE_TEMPLATE = r"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="script-src 'self' 'unsafe-inline'"><title>Sentinel trace</title>
-<style>
-:root{ --bg0:#0d1320; --bg1:#121b2d; --line:#20304c; --ink:#dbe6f5;
-       --dim:#7e90ac; --faint:#4d5f7c; --ok:#3ddc84; --err:#ff6161;
-       --warn:#ffb347; --ai:#59c2ff; --act:#9db4d6; }
-*{box-sizing:border-box;margin:0;padding:0}
-body{min-height:100vh;padding:16px;color:var(--ink);
-  font-family:"Segoe UI","Helvetica Neue",sans-serif;
-  background:
-   radial-gradient(460px 240px at -10% -20%, rgba(89,194,255,.10), transparent 60%),
-   radial-gradient(420px 260px at 112% 122%, rgba(61,220,132,.08), transparent 62%),
-   repeating-linear-gradient(0deg, transparent 0 23px, rgba(126,144,172,.05) 23px 24px),
-   linear-gradient(160deg, var(--bg1), var(--bg0));}
-.display{font-family:Bahnschrift,"Avenir Next Condensed","Arial Narrow",sans-serif}
-.mono{font-family:ui-monospace,Consolas,monospace}
-header{display:flex;align-items:center;gap:14px;padding:6px 4px 14px;border-bottom:1px solid var(--line)}
-.word{font-size:26px;font-weight:700;letter-spacing:.14em}
-.chip{font-size:10px;letter-spacing:.08em;padding:3px 8px;border-radius:4px;border:1px solid var(--line);color:var(--dim)}
-.chip.ok{color:var(--ok);border-color:rgba(61,220,132,.4)}
-.chip.ai{color:var(--ai);border-color:rgba(89,194,255,.4)}
-.chip.err{color:var(--err);border-color:rgba(255,97,97,.4)}
-.lat{margin-left:auto;text-align:right;font-size:12px;color:var(--dim)}
-.lat b{display:block;font-size:18px;color:var(--ink)}
-.grid{display:grid;grid-template-columns:minmax(0,5fr) minmax(0,4fr);gap:14px;margin-top:14px}
-.panel{border:1px solid var(--line);border-radius:6px;background:rgba(8,12,21,.7);padding:12px}
-.panel h2{font-size:9px;letter-spacing:.26em;color:var(--faint);margin-bottom:9px}
-pre{white-space:pre-wrap;word-break:break-word;font-size:11px;line-height:1.6;color:#c3d2e8;max-height:420px;overflow:auto}
-img.shot{width:100%;border:1px solid var(--line);border-radius:4px;display:block}
-table{width:100%;border-collapse:collapse;font-size:10.5px}
-th{font-size:8.5px;letter-spacing:.18em;color:var(--faint);text-align:left;padding:4px 6px;border-bottom:1px solid var(--line)}
-td{padding:4px 6px;border-bottom:1px solid rgba(32,48,76,.5);color:#c3d2e8;font-family:ui-monospace,Consolas,monospace;vertical-align:top}
-tr.hot td{color:var(--warn);background:rgba(255,179,71,.06)}
-tr.hot td:first-child{box-shadow:inset 3px 0 0 var(--warn)}
-.foot{margin-top:12px;font-size:9px;color:var(--faint)}
-@media(max-width:900px){.grid{grid-template-columns:1fr}}
-</style></head>
-<body>
-<header>
-  <div class="word display" id="word">TRACE</div>
-  <div id="chips" style="display:flex;gap:6px;flex-wrap:wrap"></div>
-  <div class="lat mono"><b id="lat">–</b>ms latency</div>
-</header>
-<div class="grid">
-  <div>
-    <div class="panel"><h2>SCREENSHOT (as sent, may be truncated)</h2><div id="shot"></div></div>
-    <div class="panel" style="margin-top:14px"><h2>PAGE TEXT (first 4000)</h2><pre id="ptext"></pre></div>
-    <div class="panel" style="margin-top:14px"><h2>ELEMENT MAP</h2><div id="emap"></div></div>
-  </div>
-  <div>
-    <div class="panel"><h2>DECISION</h2><pre id="dec"></pre></div>
-    <div class="panel" style="margin-top:14px"><h2>ASSEMBLED PROMPT</h2><pre id="prom"></pre></div>
-    <div class="panel" style="margin-top:14px"><h2>LEARNED RULES IN EFFECT</h2><pre id="rul"></pre></div>
-    <div class="panel" style="margin-top:14px"><h2>SESSION MEMORY CONTEXT</h2><pre id="mem"></pre></div>
-  </div>
-</div>
-<div class="foot mono" id="foot"></div>
-<script>
-const R = JSON.parse(decodeURIComponent("__PAYLOAD__"));
-document.title = "trace " + (R.ts || "");
-const chip = (t, c) => `<span class="chip ${c||''}">${t}</span>`;
-document.getElementById("chips").innerHTML =
-  chip(R.path, R.path === "error" ? "err" : (R.path === "model" ? "ai" : "ok")) +
-  chip((R.question_type || (R.decision && R.decision.question_type) || "–")) +
-  (R.dry_run ? chip("DRY RUN", "err") : "") +
-  (R.snap_truncated ? chip("image truncated in trace", "") : "");
-document.getElementById("word").textContent =
-  R.path === "heuristic" ? "HEURISTIC" : (R.path === "model" ? "MODEL CALL" : (R.path === "error" ? "FAILURE" : "TRACE"));
-document.getElementById("lat").textContent = R.latency_ms != null ? R.latency_ms : "–";
-const shot = document.getElementById("shot");
-if (R.snap_b64 && !R.snap_truncated) {
-  const img = new Image();
-  img.className = "shot"; img.src = "data:" + (R.snap_mime||"image/jpeg") + ";base64," + R.snap_b64;
-  shot.appendChild(img);
-} else if (R.snap_b64) {
-  shot.innerHTML = '<div style="font-size:11px;color:var(--warn)">stored prefix only (' +
-    R.snap_b64.length + ' chars) — raise SENTINEL_SNAP_MAX to embed the full frame</div>';
-} else { shot.innerHTML = '<div style="font-size:11px;color:var(--faint)">no image on this path</div>'; }
-document.getElementById("ptext").textContent = R.page_text || "–";
-const hot = new Set(((R.decision||{}).actions||[]).map(a => a.element_id).filter(v => v !== null && v !== undefined));
-let rows = "<table><tr><th>ID</th><th>TAG</th><th>TYPE</th><th>TEXT</th><th>X,Y</th></tr>";
-(R.elements||[]).forEach(e => {
-  const cls = hot.has(e.id) ? ' class="hot"' : '';
-  rows += `<tr${cls}><td>${e.id}</td><td>${e.tag||''}</td><td>${e.type||''}</td>` +
-    `<td>${(e.text||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')}</td><td>${e.x||''},${e.y||''}</td></tr>`;
-});
-document.getElementById("emap").innerHTML = rows + "</table>";
-document.getElementById("dec").textContent = R.decision ? JSON.stringify(R.decision, null, 2) : (R.error || "–");
-document.getElementById("prom").textContent = R.prompt || "– (heuristic path: no model prompt)";
-document.getElementById("rul").textContent = (R.rules||[]).join("\n") || "– none –";
-document.getElementById("mem").textContent = (R.memory_ctx||[]).join("\n") || "– empty –";
-document.getElementById("foot").textContent =
-  (R.ts||"") + "  ·  session " + (R.session||"–") + "  ·  " + (R.url||"") +
-  (R.model ? "  ·  model " + R.model : "");
-</script></body></html>"""
-
+# Lives in templates/trace.html; loaded once at import. The __PAYLOAD__
+# token is replaced per trace.
+TRACE_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "trace.html"
+TRACE_TEMPLATE = TRACE_TEMPLATE_PATH.read_text(encoding="utf-8")
 @app.middleware("http")
 async def check_token(request: Request, call_next):
+    # Fail closed on EVERY route (the old version left /status, /omni,
+    # /traces, /debug/last and /config/panel-hub wide open — an unauth
+    # POST /config/panel-hub {"url":""} cleared the login-wall stop).
+    # /status stays public: it is the liveness probe launch.bat curls.
     if request.method == "OPTIONS":
         return await call_next(request)
-    if request.url.path in ("/decide", "/learn"):
-        if AUTH_TOKEN and request.headers.get("X-Sentinel-Token") != AUTH_TOKEN:
+    if request.url.path != "/status":
+        provided = request.headers.get("X-Sentinel-Token", "")
+        if not hmac.compare_digest(provided.encode("utf-8"),
+                                   AUTH_TOKEN.encode("utf-8")):
             return JSONResponse(status_code=401, content={"detail": "unauthorized"})
     return await call_next(request)
 
+if EXTENSION_ID:
+    _cors_regex = f"chrome-extension://{re.escape(EXTENSION_ID)}"
+else:
+    # Real MV3 IDs are 32 hex chars; at least reject everything else, and
+    # make the operator pin the real one.
+    logger.warning(
+        "[!] SENTINEL_EXTENSION_ID not set — CORS accepts any well-formed "
+        "chrome-extension origin. Get your ID from chrome://extensions "
+        "and pin it in .env."
+    )
+    _cors_regex = r"chrome-extension://[0-9a-f]{32}"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"chrome-extension://.*",
+    allow_origin_regex=_cors_regex,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -200,12 +133,16 @@ TRACES_DIR = Path(os.getenv("SENTINEL_TRACES", "traces"))
 TRACE_ON = os.getenv("SENTINEL_TRACE", "1") == "1"
 DRY_RUN = os.getenv("SENTINEL_DRY_RUN", "0") == "1"
 TRACE_KEEP = int(os.getenv("SENTINEL_TRACE_KEEP", "400"))
+TRACE_AGE_H = float(os.getenv("SENTINEL_TRACE_AGE_HOURS", "72"))  # 0 = no age cap
 SNAP_MAX = int(os.getenv("SENTINEL_SNAP_MAX", "1200"))   # 0 = full
 TRACES_DIR.mkdir(parents=True, exist_ok=True)
 
 _last_debug: dict = {}                    # newest call, fully assembled
 
-client = OpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=8.0, max_retries=1) if API_KEY else None
+# 30s: a vision call with a 1280px JPEG under an 8s budget was timing out
+# on every slow router hop. 30 + one retry stays under the extension's
+# 45s /decide abort. (core.py and the extension use the same 30/45 pair.)
+client = OpenAI(api_key=API_KEY, base_url=BASE_URL, timeout=30.0, max_retries=1) if API_KEY else None
 
 # Trace-bus boot state: which LLM endpoint we're wired to (round two, §E)
 if client is not None:
@@ -223,13 +160,19 @@ else:
 # ── trace recorder ───────────────────────────────────────────────
 
 def _prune_traces():
+    # Two independent caps: a file count (TRACE_KEEP) AND an age (hours).
+    # Count-only pruning meant a quiet install kept months of answers.
     try:
+        now = time.time()
+        cutoff = now - TRACE_AGE_H * 3600
         files = sorted(TRACES_DIR.glob("*.html"),
                        key=lambda p: p.stat().st_mtime)
-        for p in files[:-TRACE_KEEP]:
-            p.unlink()
+        for p in files:
+            mtime = p.stat().st_mtime
+            if mtime < cutoff or p in files[:-TRACE_KEEP]:
+                p.unlink()
     except Exception:
-        pass
+        logger.warning("[trace] prune failed", exc_info=True)
 
 def _save_trace(rec: dict):
     """Archives one /decide call as a self-viewing HTML file."""
@@ -268,7 +211,8 @@ class Action(BaseModel):
 class SurveyDecision(BaseModel):
     page_summary: str
     question_type: Literal["single_choice", "multi_choice", "dropdown",
-                           "text", "grid", "mixed", "completion", "unknown"]
+                           "text", "grid", "mixed", "completion",
+                           "navigation", "unknown"]
     confidence: float = Field(..., ge=0, le=1)
     actions: List[Action]
     memory_note: Optional[str] = None
@@ -281,7 +225,7 @@ from participant_profile import get_persona
 MEMORY: dict = {}
 SESSION_LAST_SEEN: dict = {}
 LEARNED_RULES: List[str] = []
-RULES_FILE = "learned_rules.json"
+RULES_FILE = Path(__file__).resolve().with_name("learned_rules.json")
 SESSION_TTL = 7200
 
 def _prune_sessions():
@@ -295,321 +239,71 @@ def _prune_sessions():
 def load_rules():
     global LEARNED_RULES
     try:
-        if os.path.exists(RULES_FILE):
-            with open(RULES_FILE, "r", encoding="utf-8") as f:
-                LEARNED_RULES = json.load(f)
+        if RULES_FILE.exists():
+            LEARNED_RULES = json.loads(RULES_FILE.read_text(encoding="utf-8"))
     except Exception:
-        pass
+        logger.warning("[rules] could not load %s", RULES_FILE, exc_info=True)
 
 def save_rules():
     try:
-        with open(RULES_FILE, "w", encoding="utf-8") as f:
-            json.dump(LEARNED_RULES, f, indent=2)
+        RULES_FILE.write_text(json.dumps(LEARNED_RULES, indent=2), encoding="utf-8")
     except Exception:
-        pass
+        logger.warning("[rules] could not save %s", RULES_FILE, exc_info=True)
 
 load_rules()
 
-# ── heuristic engine (unchanged) ─────────────────────────────────
-
-COMMON_ANSWERS = {
-    "age": "32", "gender": "Female", "postal code": "400001",
-    "zip": "400001", "pincode": "400001", "income": "₹12,00,000",
-    "education": "Graduate", "employment": "Full-time",
-    "industry": "Information Technology", "decision maker": "Yes",
-}
-
-def try_heuristic(question: str, elements: List[dict]) -> Optional[tuple[List[Action], str]]:
-    """
-    Local heuristic fallback for /decide when LLM is unreachable.
-    Returns (actions, memory_note) or None to fall through to LLM path.
-
-    Phases:
-      0. Categorize elements by REAL interactive type (handles content script payload format)
-      1. Industry trap
-      2. Select-all checkbox groups
-      3. Keyword-matched text inputs
-      4. Generic text-input filler for unmatched fields
-      5. Select dropdowns
-      6. Checkboxes — check all unchecked
-      7. Radio buttons — pick first unselected per group
-      8. Navigation button ONLY when zero fields remain
-    """
-    q = question.lower()
-    actions: List[Action] = []
-    notes: List[str] = []
-    targeted_ids: set = set()
-
-    # ── Helper: determine REAL interactive type ─────────────────────
-    # The content script sends `type` as high-level category:
-    #   "input" for ALL <input> elements (text, checkbox, radio, etc.)
-    #   "select" for <select> dropdowns
-    #   "textarea" for <textarea>
-    #   "button" for <button>
-    #   "label" for <label>
-    # The actual HTML input type is in input_type, tagType, or tag.
-    def _real_type(el):
-        etype = el.get("type", "")
-        if etype == "select":
-            return "select"
-        if etype == "textarea":
-            return "textarea"
-        if etype == "button":
-            return "button"
-        if etype == "label":
-            return "label"
-        if etype == "input":
-            # Check all possible fields for actual HTML input type
-            real = str(el.get("input_type", "") or el.get("tagType", "") or el.get("tag", "")).lower().strip()
-            if real in ("checkbox", "radio", "text", "email", "tel", "number", "date", "password", "url", "search", "hidden"):
-                return real
-            # Infer from properties
-            if "checked" in el:
-                return "checkbox"  # safest default; radio also has checked but we group later
-            if el.get("options"):
-                return "select"
-            return "text"
-        return etype
-
-    def _is_text_input(el):
-        return _real_type(el) in ("text", "email", "tel", "number", "date", "password", "url", "search", "hidden")
-
-    def _is_checkbox(el):
-        return _real_type(el) == "checkbox"
-
-    def _is_radio(el):
-        return _real_type(el) == "radio"
-
-    def _is_select(el):
-        return _real_type(el) == "select"
-
-    # ── helpers ──────────────────────────────────────────────────────
-    def _search_text(el):
-        return " ".join(str(p) for p in filter(None, [
-            el.get("name", ""), el.get("placeholder", ""),
-            el.get("text", ""), el.get("id", "")
-        ])).lower().replace("_", " ").replace("-", " ")
-
-    def _generic_value(el):
-        name = _search_text(el)
-        real = _real_type(el)
-        if any(x in name for x in ["first", "fname"]):
-            return "Alex"
-        if any(x in name for x in ["last", "lname"]):
-            return "Morgan"
-        if "email" in name:
-            return "alex.morgan@example.com"
-        if any(x in name for x in ["phone", "tel", "mobile"]):
-            return "555-0123"
-        if any(x in name for x in ["company", "org"]):
-            return "Acme Corporation"
-        if any(x in name for x in ["job", "title", "position"]):
-            return "Software Engineer"
-        if any(x in name for x in ["comment", "message", "note", "feedback"]):
-            return "Interested in your services. Please contact me."
-        if "address" in name and "email" not in name:
-            return "123 Main Street"
-        if "city" in name:
-            return "Springfield"
-        if any(x in name for x in ["zip", "postal"]):
-            return "12345"
-        if "state" in name:
-            return "CA"
-        if "country" in name:
-            return "United States"
-        if _real_type(el) == "textarea":
-            return "Interested in learning more about your services."
-        if real == "number":
-            return "42"
-        if real == "date":
-            return "1990-01-01"
-        if real == "password":
-            return "SecurePass123!"
-        return "N/A"
-
-    # ── Phase 0: Count total answerable fields ───────────────────────
-    answerable = [e for e in elements if _real_type(e) in (
-        "text", "email", "tel", "number", "date", "password", "url", "search",
-        "textarea", "select", "checkbox", "radio"
-    )]
-
-    # ── Phase 1: industry trap ───────────────────────────────────────
-    industry_words = ("market research", "advertising", "marketing")
-    is_industry_q = ((re.search(r"\bwork in\b", q) and any(t in q for t in industry_words))
-                     or "do you work in any of the following" in q
-                     or "work in the following industries" in q)
-    if is_industry_q:
-        for e in elements:
-            if "none" in e.get("text", "").lower():
-                if e.get("checked") is True:
-                    return [Action(action_type="next",
-                                   reasoning="Industry trap already answered -> next")],                            "industry already answered"
-                return [Action(action_type="click", element_id=e["id"],
-                               reasoning="Industry trap: none of the above")], "industry trap: none"
-        for e in elements:
-            if "other" in e.get("text", "").lower():
-                if e.get("checked") is True:
-                    continue
-                return [Action(action_type="click", element_id=e["id"],
-                               value="Engineering",
-                               reasoning="Industry trap via Other")], "industry trap: other"
-
-    # ── Phase 2: select-all checkbox groups ──────────────────────────
-    if any(w in q for w in ("select all that apply", "check all that apply",
-                            "check all", "select any that")):
-        for e in elements:
-            if not _is_checkbox(e) and e.get("tag") not in ("label", "li"):
-                continue
-            text = e.get("text", "").lower()
-            if any(bad in text for bad in ("none", "don't know", "prefer not", "not sure")):
-                continue
-            if e.get("checked") is True:
-                continue
-            actions.append(Action(action_type="click", element_id=e["id"],
-                                  reasoning="Select-all heuristic"))
-            targeted_ids.add(e["id"])
-        if actions:
-            actions.append(Action(action_type="next",
-                                  reasoning="Proceed after select-all"))
-            return actions, "select-all heuristic"
-        if any(_is_checkbox(e) or e.get("tag") in ("label", "li") for e in elements):
-            return [Action(action_type="next",
-                           reasoning="Select-all already satisfied -> next")],                    "select-all already answered"
-
-    # ── Phase 3: keyword-matched text inputs ─────────────────────────
-    for e in elements:
-        if _is_text_input(e) or _real_type(e) == "textarea":
-            if e["id"] in targeted_ids:
-                continue
-            if (e.get("value") or "").strip():
-                targeted_ids.add(e["id"])
-                continue
-            search = _search_text(e)
-            for kw, ans in COMMON_ANSWERS.items():
-                if kw in search:
-                    actions.append(Action(action_type="type",
-                                          element_id=e["id"],
-                                          value=ans,
-                                          reasoning=f"keyword_match:{kw}"))
-                    targeted_ids.add(e["id"])
-                    notes.append(f"filled '{e.get('name','')}' via keyword '{kw}'")
-                    break
-
-    # ── Phase 4: generic text-input filler ───────────────────────────
-    for e in elements:
-        if _is_text_input(e) or _real_type(e) == "textarea":
-            if e["id"] in targeted_ids:
-                continue
-            if (e.get("value") or "").strip():
-                targeted_ids.add(e["id"])
-                continue
-            val = _generic_value(e)
-            actions.append(Action(action_type="type",
-                                  element_id=e["id"],
-                                  value=val,
-                                  reasoning="generic_fill:unmatched_text_input"))
-            targeted_ids.add(e["id"])
-            notes.append(f"generic-filled '{e.get('name', e.get('placeholder',''))}' with '{val}'")
-
-    # ── Phase 5: select dropdowns ────────────────────────────────────
-    for e in elements:
-        if _is_select(e) and e["id"] not in targeted_ids:
-            opts = [opt for opt in (e.get("options") or [])
-                    if opt.get("value") is not None and not opt.get("disabled")]
-            if opts:
-                # Pick first non-placeholder option
-                chosen = opts[0]
-                for opt in opts:
-                    txt = str(opt.get("text", "")).lower().strip()
-                    if txt and txt not in ("", "select...", "choose...", "—", "-", "none", "pick one", "select an option"):
-                        chosen = opt
-                        break
-                actions.append(Action(action_type="select_option",
-                                      element_id=e["id"],
-                                      value=chosen.get("text", chosen.get("value", "")),
-                                      reasoning=f"select {chosen.get('text','')[:40]}"))
-                targeted_ids.add(e["id"])
-                notes.append(f"selected dropdown '{e.get('name','')}'")
-
-    # ── Phase 6: checkboxes — check ALL unchecked ────────────────────
-    for e in elements:
-        if _is_checkbox(e) and e["id"] not in targeted_ids:
-            if e.get("checked") is True:
-                targeted_ids.add(e["id"])
-                continue
-            actions.append(Action(action_type="click",
-                                  element_id=e["id"],
-                                  reasoning="checkbox_check"))
-            targeted_ids.add(e["id"])
-            notes.append(f"checked '{e.get('name', e.get('text','checkbox'))}'")
-
-    # ── Phase 7: radio buttons — pick first unselected per group ─────
-    radio_groups = {}
-    for e in elements:
-        if _is_radio(e):
-            key = e.get("name") or e.get("sid") or e.get("id")
-            radio_groups.setdefault(key, []).append(e)
-
-    chosen_groups: set = set()
-    for e in elements:
-        if not _is_radio(e):
-            continue
-        if e.get("checked") is True:
-            targeted_ids.add(e["id"])
-            continue
-        if e["id"] in targeted_ids:
-            continue
-        name = (e.get("name") or "").strip()
-        text = (e.get("text", "") or "").lower()
-        if "none" in text or "don't know" in text or "prefer not" in text:
-            continue
-        if name:
-            if name in chosen_groups:
-                continue
-            if any(g.get("checked") for g in radio_groups.get(name, [])):
-                continue
-            chosen_groups.add(name)
-        actions.append(Action(action_type="click", element_id=e["id"],
-                              reasoning=f"pick {text[:40]}"))
-        targeted_ids.add(e["id"])
-        notes.append(f"picked '{text[:40]}'")
-        break  # one radio action per cycle
-
-    # ── Phase 8: navigation button ONLY when truly done ──────────────
-    # Count how many answerable fields are still NOT targeted
-    pending = sum(1 for e in answerable if e["id"] not in targeted_ids)
-
-    if pending == 0:
-        for e in elements:
-            if e.get("type") == "button" or (e.get("tag") == "button"):
-                btn_text = (e.get("text", "") + " " + e.get("name", "")).lower()
-                if any(x in btn_text for x in ["next", "continue", "start", "begin", "submit", "send"]):
-                    actions.append(Action(action_type="next",
-                                          reasoning=f"navigation_button:{e.get('text','')[:40]}"))
-                    targeted_ids.add(e["id"])
-                    notes.append(f"clicked navigation button '{e.get('text','')}'")
-                    break
-
-    if actions:
-        note = "; ".join(notes) if notes else "heuristic"
-        return actions, note
-
-    return None
-
 # ── panel-hub host matching (mirrors core.is_survey_router_hub) ──
 def is_panel_hub(url: str) -> bool:
-    try:
-        u = urllib.parse.urlsplit((url or "").lower().strip())
-        host = u.netloc or u.path
-    except Exception:
-        host = (url or "").lower()
-    if host.startswith("www."):
-        host = host[4:]          # leading label only — matches hub_match.js
-    host = host.split(":")[0].split("/")[0]
-    return any(host == d or host.endswith("." + d)
-               for d in get_panel_hub_domains())
+    """Thin alias — the implementation lives in panel_config
+    (host_matches_hubs) and is asserted by the shared test tables
+    next to the JS twin. Three matchers is how the trailing-dot
+    and path-stripping variants crept in."""
+    return host_matches_hubs(url)
+
 
 # ── endpoints ────────────────────────────────────────────────────
+
+# Payload bounds: /decide used to cap only the screenshot; a hostile or
+# buggy page could still ship megabytes of elements/page_text into the
+# prompt AND straight into the trace file.
+MAX_ELEMENTS = 400
+MAX_PAGE_TEXT = 20_000
+
+
+def _heuristic_or_stop(rec, req, session_id, t0, cycle, reason):
+    """Serve the deterministic fallback when the model path is off the
+    table (provider down, no key, LLM timeout). One implementation —
+    /decide used to carry three copies of this block."""
+    try:
+        heuristic = heuristic_decide(req.elements, req.page_text)
+    except Exception:
+        logger.warning("[heuristic] heuristic_decide raised (cycle %s)", cycle, exc_info=True)
+        heuristic = None
+    if heuristic and heuristic.get("actions"):
+        bus.record("backend", "heuristic",
+                   f"cycle {cycle}: LLM bypassed ({reason}) — heuristic serves "
+                   f"({heuristic.get('page_summary', 'heuristic')})",
+                   {"cycle": cycle, "reason": reason}, level="warn")
+        decision = SurveyDecision(
+            page_summary=heuristic.get("page_summary", "heuristic"),
+            question_type=heuristic.get("question_type", "unknown"),
+            confidence=heuristic.get("confidence", 0.2),
+            actions=heuristic["actions"],
+            memory_note=heuristic.get("memory_note"),
+            source="heuristic",
+        )
+        return _finish(rec, req, session_id, decision, t0, path="heuristic")
+    decision = SurveyDecision(
+        page_summary=f"heuristic: {reason}, no actions",
+        question_type="completion",
+        confidence=0.2,
+        actions=[],
+        memory_note=f"provider_down: {reason}",
+        source="heuristic",
+    )
+    return _finish(rec, req, session_id, decision, t0, path="heuristic")
+
+
 
 class DecideRequest(BaseModel):
     session_id: str
@@ -661,64 +355,25 @@ async def decide(req: DecideRequest):
                    latency_ms=int((time.time() - t0) * 1000))
         record_trace(rec)
         raise HTTPException(status_code=413, detail="screenshot too large")
+    if len(req.elements) > MAX_ELEMENTS:
+        raise HTTPException(status_code=413,
+                            detail=f"too many elements ({len(req.elements)} > {MAX_ELEMENTS})")
+    if len(req.page_text) > MAX_PAGE_TEXT:
+        raise HTTPException(status_code=413,
+                            detail=f"page text too long ({len(req.page_text)} > {MAX_PAGE_TEXT})")
 
-    heuristic = None
-    if heuristic_decide is not None:
-        try:
-            heuristic = heuristic_decide(req.elements, req.page_text)
-        except Exception:
-            heuristic = None
-    if heuristic and heuristic.get("actions"):
-        actions = heuristic["actions"]
-        note = heuristic.get("page_summary", "heuristic")
-        bus.record("backend", "heuristic",
-                   f"cycle {cycle}: served locally — LLM bypassed ({note})",
-                   {"cycle": cycle, "note": note}, level="info")
-        decision = SurveyDecision(
-            page_summary=heuristic.get("page_summary", "heuristic"),
-            question_type=heuristic.get("question_type", "unknown"),
-            confidence=heuristic.get("confidence", 0.2),
-            actions=actions,
-            memory_note=heuristic.get("memory_note"),
-            source="heuristic",
-        )
-        decision = _finish(rec, req, session_id, decision, t0, path="heuristic")
-        return decision
-
-    # ── provider health gate — if the external API is unreachable, use heuristic ──
+    # ── provider health gate — the model is PRIMARY; the heuristic only
+    #    serves when the provider is genuinely unavailable (the contract
+    #    sentinel_heuristic.py's docstring has always claimed). Health is
+    #    cached 30s, so this costs at most one local /models round trip
+    #    per half-minute on the request path.
+    if client is None:
+        return _heuristic_or_stop(rec, req, session_id, t0, cycle,
+                                  reason="no API key configured")
     health = await asyncio.to_thread(provider_health.health)
-    if not health["api_ready"] or client is None:
-        if heuristic is None:
-            try:
-                heuristic = heuristic_decide(req.elements, req.page_text)
-            except Exception:
-                heuristic = None
-        if heuristic and heuristic.get("actions"):
-            actions = heuristic["actions"]
-            note = heuristic.get("page_summary", "heuristic")
-            bus.record("backend", "heuristic",
-                       f"cycle {cycle}: provider down — LLM bypassed ({note})",
-                       {"cycle": cycle, "note": note}, level="warn")
-            decision = SurveyDecision(
-                page_summary=heuristic.get("page_summary", "heuristic"),
-                question_type=heuristic.get("question_type", "unknown"),
-                confidence=heuristic.get("confidence", 0.2),
-                actions=actions,
-                memory_note=heuristic.get("memory_note"),
-                source="heuristic",
-            )
-            decision = _finish(rec, req, session_id, decision, t0, path="heuristic")
-            return decision
-        decision = SurveyDecision(
-            page_summary="heuristic: provider down, no actions",
-            question_type="completion",
-            confidence=0.2,
-            actions=[],
-            memory_note=f"provider_down: {health['error']}",
-            source="heuristic",
-        )
-        decision = _finish(rec, req, session_id, decision, t0, path="heuristic")
-        return decision
+    if not health["api_ready"]:
+        return _heuristic_or_stop(rec, req, session_id, t0, cycle,
+                                  reason=f"provider unavailable: {health['error']}")
 
     # ── model path: build the image the model ACTUALLY sees ──────
     screenshot_b64 = req.screenshot_b64
@@ -736,7 +391,9 @@ async def decide(req: DecideRequest):
         screenshot_b64 = req.screenshot_b64
 
     # ── sniper mode: for dense lists (>50 options), ask for keywords only ──
-    if any(k in req.page_text.lower() for k in ["choose the brand you trust most", "60 options", "sniper-path threshold"]) or len(req.elements) > 50:
+    # (The old trigger also matched three literal strings from
+    # survey-test.html — test fixtures living in production.)
+    if len(req.elements) > 50:
         sniper_prompt = f"Question: \"{req.page_text[:1500]}\"\nThis is a large single-choice list. Look at your Persona and tell me exactly what 1-2 keywords I should search for in the list to find your answer (e.g., 'Mumbai', 'Maharashtra', or '1994'). Reply ONLY with the keywords, nothing else."
         try:
             with omni_call(provider="openai-compat", model=MODEL,
@@ -747,27 +404,35 @@ async def decide(req: DecideRequest):
                     max_tokens=50, temperature=0.2
                 )
             keyword = resp.choices[0].message.content.strip().strip("*'\"` ")
-            match = next((e for e in req.elements if keyword.lower() in e.get("text", "").lower()), None)
-            if match:
-                decision = SurveyDecision(
-                    page_summary=f"sniper: {keyword}",
-                    question_type="single_choice",
-                    confidence=0.9,
-                    actions=[Action(action_type="click", element_id=match["id"],
-                                    reasoning=f"Sniper hit: {keyword}")],
-                    memory_note=f"sniper selected {match.get('text','')}"
-                )
-                return _finish(rec, req, session_id, decision, t0, path="sniper")
+            # Guard rails: an empty/1-char keyword matches element 0 and
+            # friends; a keyword that matches several options is a coin
+            # flip. Both fall through to the full model path instead.
+            if len(keyword) >= 3:
+                matches = [e for e in req.elements
+                           if keyword.lower() in (e.get("text") or "").lower()]
+                if len(matches) == 1:
+                    match = matches[0]
+                    decision = SurveyDecision(
+                        page_summary=f"sniper: {keyword}",
+                        question_type="single_choice",
+                        confidence=0.9,
+                        actions=[Action(action_type="click", element_id=match["id"],
+                                        reasoning=f"Sniper hit: {keyword}")],
+                        memory_note=f"sniper selected {match.get('text','')}"
+                    )
+                    return _finish(rec, req, session_id, decision, t0, path="sniper")
+                if len(matches) > 1:
+                    logger.warning("[sniper] keyword %r matched %d options — "
+                                   "refusing to guess", keyword, len(matches))
         except Exception:
-            pass
+            logger.warning("[sniper] path failed — falling through to full model call",
+                           exc_info=True)
 
     # ── image trap OCR: if an image is present and a text input nearby, try OCR ──
     img_text = ""
     try:
         imgs = [e for e in req.elements if e.get("tag") == "img"]
-        if imgs:
-            import base64, io
-            from PIL import Image
+        if imgs and req.screenshot_b64:
             img_b64 = req.screenshot_b64
             if img_b64:
                 img_data = base64.b64decode(img_b64)
@@ -796,13 +461,12 @@ async def decide(req: DecideRequest):
         req.page_text += f"\n[IMAGE TEXT: {img_text}]"
 
     # ── iframe hint: if page has iframe, add instructions to prompt ──
+    # (content.js marks in-iframe entries with a truthy `frame`; there is
+    # no `self` here — this used to be a silent paste from core.py.)
     iframe_hint = ""
-    try:
-        iframes = self.driver.find_elements(By.TAG_NAME, "iframe") if hasattr(self, 'driver') else []
-        if iframes:
-            iframe_hint = "\nNOTE: This page contains an iframe. After answering the main page, switch to the iframe context to answer its question."
-    except Exception:
-        pass
+    if any(e.get("frame") for e in req.elements):
+        iframe_hint = ("\nNOTE: Some elements are inside an iframe (they carry a "
+                       "frame flag). Answer the main page first, then the iframe's question.")
 
     memory_block = ("\n".join(MEMORY[session_id][-12:])
                     if MEMORY[session_id] else "None yet.")
@@ -838,7 +502,7 @@ Return JSON matching the SurveyDecision schema with actions for ALL visible ques
             logger.info(f"[omni] structured -> base_url={client.base_url} model={MODEL}")
             with omni_call(provider="openai-compat", model=MODEL,
                            cycle=rec.get("cycle")):
-                resp = client.beta.chat.completions.parse(
+                resp = client.chat.completions.parse(
                     model=MODEL,
                     messages=[
                             {"role": "system", "content": get_persona()},
@@ -930,18 +594,21 @@ Return JSON matching the SurveyDecision schema with actions for ALL visible ques
         try:
             heuristic = heuristic_decide(req.elements, req.page_text)
         except Exception:
+            logger.warning("[heuristic] heuristic_decide raised during timeout fallback",
+                           exc_info=True)
             heuristic = None
         if heuristic and heuristic.get("actions"):
-            decision = SurveyDecision(
+            return _finish(rec, req, session_id, SurveyDecision(
                 page_summary=heuristic.get("page_summary", "heuristic"),
                 question_type=heuristic.get("question_type", "unknown"),
                 confidence=heuristic.get("confidence", 0.2),
                 actions=heuristic["actions"],
                 memory_note=heuristic.get("memory_note"),
                 source="heuristic",
-            )
-            decision = _finish(rec, req, session_id, decision, t0, path="heuristic")
-            return decision
+            ), t0, path="heuristic")
+        # "navigation" is a member of SurveyDecision.question_type — this
+        # used to raise a ValidationError *inside the except handler* and
+        # turn the one graceful-degradation path into an HTTP 500.
         decision = SurveyDecision(
             page_summary="heuristic: timeout, no actions",
             question_type="navigation",
@@ -950,8 +617,7 @@ Return JSON matching the SurveyDecision schema with actions for ALL visible ques
             memory_note="timeout_no_actions",
             source="heuristic",
         )
-        decision = _finish(rec, req, session_id, decision, t0, path="heuristic")
-        return decision
+        return _finish(rec, req, session_id, decision, t0, path="heuristic")
     except Exception as e:
         rec.update(path="error", error=f"{type(e).__name__}: {e}",
                    latency_ms=int((time.time() - t0) * 1000))
@@ -1047,16 +713,18 @@ async def status():
 # ── omni detail panel (round eleven: live router visibility) ─────
 
 def _key_hint(key: str):
-    """Safe key fingerprint for the debug panel — never the full key."""
+    """Key fingerprint for the debug panel — a hash prefix only.
+    (The old form leaked first-6 + last-4 of the real key, which is more
+    than an unauthenticated-ish panel needs.)"""
     if not key:
         return None
-    return f"{key[:6]}…{key[-4:]}" if len(key) > 12 else "set"
+    return "sha256:" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
 
 
 def _omni_detail() -> dict:
     """Payload for GET /omni — tolerates fields the omni layer doesn't
     populate (they render as '—' in the console)."""
-    o = bus.omni
+    o = bus.get_omni()   # deep copy under the bus lock — no torn reads
     lat = o.get("latency_history", [])
     srt = sorted(lat)
     models = {k: {**v, "avg_ms": round(v["total_ms"] / max(1, v["calls"]), 1)}
@@ -1108,25 +776,31 @@ async def omni_ping():
             )
         reply = (resp.choices[0].message.content or "").strip()
         ms = (time.time() - t0) * 1000
-        bus.omni["last_ping"] = {"t": time.time(), "ms": round(ms, 1),
-                                 "ok": True, "reply": str(reply)[:120]}
+        ping = {"t": time.time(), "ms": round(ms, 1), "ok": True,
+                "reply": str(reply)[:120]}
+        bus.note_omni_ping(ping)
         bus.record("omni", "ping",
                    f"ping ok in {ms:.0f} ms — {str(reply)[:60]}",
-                   dict(bus.omni["last_ping"]), ms=ms)
+                   dict(ping), ms=ms)
     except Exception as e:
         ms = (time.time() - t0) * 1000
-        bus.omni["last_ping"] = {"t": time.time(), "ms": round(ms, 1),
-                                 "ok": False, "reply": str(e)[:120]}
+        ping = {"t": time.time(), "ms": round(ms, 1), "ok": False,
+                "reply": str(e)[:120]}
+        bus.note_omni_ping(ping)
         bus.record("omni", "ping",
                    f"ping FAILED after {ms:.0f} ms — {e}",
-                   dict(bus.omni["last_ping"]), level="error", ms=ms)
-    return bus.omni["last_ping"]
+                   dict(ping), level="error", ms=ms)
+    return ping
 
 
 # ── panel hub configuration (edited from the extension popup) ────
 
+MAX_PANEL_HUBS = 50
+
+
 class PanelHubRequest(BaseModel):
-    url: str = Field(..., description="Panel link/domain to add; empty string clears all")
+    url: str = Field(..., description="Panel link/domain; empty string clears all")
+    remove: bool = Field(False, description="Set true to remove this domain instead of adding it")
 
 
 @app.get("/config/panel-hub")
@@ -1136,21 +810,45 @@ async def read_panel_hubs():
 
 @app.post("/config/panel-hub")
 async def write_panel_hub(req: PanelHubRequest):
-    if req.url.strip():
-        domains = set_panel_hub_domains(list(get_panel_hub_domains()) + [req.url])
-        bus.record("backend", "config",
-                   f"panel hub added: {domains[-1] if domains else '(rejected)'}",
-                   {"panel_hubs": list(domains)}, level="info")
-    else:
+    """Append, remove-one, or nuke. (There used to be no way to remove a
+    single domain — a typo'd hub could only be cleared out with the whole
+    safety list.)"""
+    current = list(get_panel_hub_domains())
+    if not req.url.strip():
         domains = set_panel_hub_domains([])
         bus.record("backend", "config", "panel hubs cleared",
                    {"panel_hubs": []}, level="info")
+        return {"panel_hubs": list(domains)}
+
+    from panel_config import extract_host
+    target = extract_host(req.url)
+    if req.remove:
+        if not target:
+            raise HTTPException(status_code=400, detail="unparseable domain")
+        domains = set_panel_hub_domains([d for d in current if d != target])
+        bus.record("backend", "config", f"panel hub removed: {target}",
+                   {"panel_hubs": list(domains)}, level="info")
+        return {"panel_hubs": list(domains)}
+
+    if not target:
+        raise HTTPException(status_code=400, detail="unparseable domain")
+    if target not in current and len(current) >= MAX_PANEL_HUBS:
+        raise HTTPException(status_code=400,
+                            detail=f"panel hub list is full (max {MAX_PANEL_HUBS})")
+    domains = set_panel_hub_domains(current + [req.url])
+    bus.record("backend", "config", f"panel hub added: {target}",
+               {"panel_hubs": list(domains)}, level="info")
     return {"panel_hubs": list(domains)}
 
 # ── prompt inspector ─────────────────────────────────────────────
 
 @app.get("/debug/last")
 async def debug_last():
+    # Carries the fully assembled prompt and get_persona() — i.e. the
+    # operator's real profile.json. Behind an explicit opt-in flag now.
+    if not DEBUG_ON:
+        raise HTTPException(status_code=404,
+                            detail="debug disabled — set SENTINEL_DEBUG=1 to enable")
     if not _last_debug:
         return {"detail": "no calls yet"}
     return _last_debug

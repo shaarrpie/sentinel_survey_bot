@@ -1,0 +1,9 @@
+{
+  "name": "sentinel-survey-bot",
+  "private": true,
+  "version": "1.1.0",
+  "description": "Node test runner for the shared panel-hub matcher fixture",
+  "scripts": {
+    "test": "node test_hub_matcher.node.js"
+  }
+}

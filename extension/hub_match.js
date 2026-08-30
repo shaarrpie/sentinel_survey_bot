@@ -6,8 +6,11 @@
 
 function hubNormalizeHost(url) {
     try {
+        // .replace(/\.$/, '') — trailing-dot FQDNs (panel.example.com.)
+        // resolve identically but matched neither host === d nor
+        // endsWith('.' + d). Keep in lockstep with panel_config.extract_host.
         return String(url || '').trim()
-            ? new URL(url).hostname.toLowerCase().replace(/^www\./, '')
+            ? new URL(url).hostname.toLowerCase().replace(/^www\./, '').replace(/\.$/, '')
             : '';
     } catch (e) { return ''; }
 }

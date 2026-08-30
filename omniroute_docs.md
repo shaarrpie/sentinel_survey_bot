@@ -1,6 +1,6 @@
 # OmniRoute — External Dependency Documentation
 
-**Location:** `C:\Users\tiajungba\.omniroute\` (installed globally via npm)
+**Location:** `%USERPROFILE%\.omniroute\` (installed globally via npm)
 **Package:** `omniroute` v3.8.49
 **Repo:** https://github.com/diegosouzapw/OmniRoute
 **Homepage:** https://omniroute.online
@@ -34,7 +34,7 @@ Relevant config in `.env`:
 ## 3. Directory Structure (Installed Global Package)
 
 ```
-C:\Users\tiajungba\AppData\Roaming\npm\node_modules\omniroute\
+%USERPROFILE%\AppData\Roaming\npm\node_modules\omniroute\
 ├── package.json              # Project metadata, scripts, dependencies
 ├── bin/
 │   ├── omniroute.mjs         # CLI entry point
@@ -154,7 +154,7 @@ MITM_ENABLED=false
 2. **The source is TypeScript/Next.js.** It compiles to `dist/` for production.
 3. **Do not modify files under `node_modules/`.** Changes will be lost on reinstall.
 4. **To update OmniRoute:** `npm install -g omniroute`
-5. **Logs and call data** are stored in `C:\Users\tiajungba\.omniroute\logs\` and `call_logs\`.
+5. **Logs and call data** are stored in `%USERPROFILE%\.omniroute\logs\` and `call_logs\`.
 
 ---
 
@@ -165,5 +165,5 @@ MITM_ENABLED=false
 | Start server | `npx omniroute` |
 | CLI help | `omniroute --help` |
 | Check status | `curl http://localhost:20128/api/monitoring/health` |
-| View logs | `C:\Users\tiajungba\.omniroute\logs\application\app.log` |
+| View logs | `%USERPROFILE%\.omniroute\logs\application\app.log` |
 | Reset password | `omniroute reset-password` |
