@@ -166,23 +166,25 @@ def omni_call(provider=None, model=None, cycle=None):
 def probe_omni(router_obj=None):
     """Call once at startup with your omni router instance. Adapts to
     common shapes: .status(), .provider/.model attrs, or a plain dict."""
-    o = bus.omni
-    try:
-        if router_obj is None:
-            raise RuntimeError("no router instance passed to probe_omni()")
-        info = router_obj.status() if hasattr(router_obj, "status") else {}
-        if isinstance(router_obj, dict):
-            info = router_obj
-        info = info or {}
-        o["loaded"] = True
-        o["provider"] = info.get("provider") or getattr(router_obj, "provider", None)
-        o["model"] = info.get("model") or getattr(router_obj, "model", None)
-        o["base_url"] = info.get("base_url") or getattr(router_obj, "base_url", None)
-        o["api_key_set"] = bool(info.get("api_key_set",
-                                         getattr(router_obj, "api_key", None)))
-    except Exception as e:
-        o["loaded"] = False
-        o["last_error"] = f"probe failed: {e}"
+    with bus._lock:
+        o = bus.omni
+        try:
+            if router_obj is None:
+                raise RuntimeError("no router instance passed to probe_omni()")
+            info = router_obj.status() if hasattr(router_obj, "status") else {}
+            if isinstance(router_obj, dict):
+                info = router_obj
+            info = info or {}
+            o["loaded"] = True
+            o["provider"] = info.get("provider") or getattr(router_obj, "provider", None)
+            o["model"] = info.get("model") or getattr(router_obj, "model", None)
+            o["base_url"] = info.get("base_url") or getattr(router_obj, "base_url", None)
+            o["api_key_set"] = bool(info.get("api_key_set",
+                                             getattr(router_obj, "api_key", None)))
+        except Exception as e:
+            o["loaded"] = False
+            o["last_error"] = f"probe failed: {e}"
+        o = copy.deepcopy(bus.omni)   # for the record below, out of the lock
     bus.record("sys", "state",
                f"omni router {'LOADED' if o['loaded'] else 'NOT LOADED'}"
                + (f" — {o['provider']}/{o['model']}" if o["loaded"] else ""),
