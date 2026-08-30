@@ -1,0 +1,43 @@
+{
+  "note": "Copy this file to profile.json (which is gitignored) and fill it with YOUR real, genuine participant details. Do NOT invent values to qualify for studies — panels detect and ban inconsistent or false profiles. Leave a field null/empty if it does not apply. profile.json is loaded by participant_profile.get_persona() and injected into the bot persona.",
+  "demographics": {
+    "age": null,
+    "gender": null,
+    "city": null,
+    "state": null,
+    "pincode": null,
+    "education": null,
+    "employment": null,
+    "industry": null,
+    "job_title": null,
+    "company_size": null,
+    "household_income_inr": null,
+    "marital_status": null,
+    "children": null
+  },
+  "household": {
+    "home_ownership": null,
+    "vehicles": [],
+    "pets": []
+  },
+  "finance": {
+    "bank": null,
+    "credit_cards": [],
+    "investments": [],
+    "insurance": []
+  },
+  "consumer": {
+    "online_shopping_frequency": null,
+    "categories": [],
+    "upcoming_purchases": []
+  },
+  "technology": {
+    "devices": [],
+    "subscriptions": []
+  },
+  "decision_maker": {
+    "household": null,
+    "software": null,
+    "hardware": null
+  }
+}

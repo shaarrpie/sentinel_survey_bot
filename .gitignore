@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+profile.json
 
 # Python
 __pycache__/

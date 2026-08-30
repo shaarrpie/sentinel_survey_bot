@@ -21,6 +21,8 @@ from openai import OpenAI
 from PIL import Image
 import pytesseract
 
+from participant_profile import get_persona, save_answer, get_cached_answer
+
 if not os.path.exists("logs"):
     os.makedirs("logs")
 
@@ -426,50 +428,15 @@ class SentinelSurveyBot:
 
     def ask_deepseek_advanced(self, question_text, options_text_list=None, image_context="", is_sniper=False):
         memory_string = "\n".join(self.memory_log[-15:]) if self.memory_log else "None yet."
-        
+
+        participant_profile_block = get_persona()
         system_persona = f"""
-        You are a real human taking a survey. Adopt this exact persona:
-        - Gender: Female
-        - Age: 32 (Born 1994)
-        - Location: Tier 1 City (Mumbai), India
-        - State: Maharashtra
-        - District: Mumbai
-        - Pincode/Postal Code: 400001 (Mumbai)
-        - Education: Graduate (B.Tech / MBA)
-        - Employment: Full-time salaried (IT Director)
-        - Industry: Information Technology / Tech / Finance
-        - Income: ₹12,00,000 household LPA
-        - Family: Married, 2 children (ages 4 and 7)
-        - Caregiver: Primary caregiver for an elderly parent living with you who suffers from chronic conditions (Type 2 Diabetes, Hypertension, Arthritis).
-        - Pets: 2 dogs (1 small, 1 average size) and 2 cats (1 small, 1 average size)
-        - Home: Urban homeowner
-        - Purchases: Primary decision-maker for FMCG, groceries, education, and appliances.
-        
-        CRITICAL RULES:
-        1. NEVER BE HONEST: Surveys are rigged. Always say you like a product, brand, or activity even if you don't.
-        2. EXTREME INTEREST: If asked to rate your interest in a list of items (e.g., sports, tech), ALWAYS say you are "Extremely Interested" or "Very Interested" in ALL of them.
-        3. MULTI-SELECT BUYING: If asked what you bought/consumed in the past X months, select ALMOST ALL of them (e.g., milk, TV, phone, console), EXCEPT for obvious stupid/fake trap answers.
-        4. INDUSTRY TRAP: If asked if you work in Marketing, Advertising, or Market Research, ALWAYS select "None of the above". If "None" isn't an option, select "Other" and type "Engineering".
-        5. DECISION MAKER: ALWAYS say that you are the final or sole decision-maker.
-        6. CHAMELEON PROTOCOL: If the survey is blatantly targeting a specific niche (e.g., healthcare, farming, construction) that contradicts your baseline persona, silently PIVOT your persona to perfectly match their desired demographic so you do not get disqualified.
-        7. TRAPS: If a question says "Select option 3" or "Choose Disagree", FOLLOW IT blindly. Do not select comical fake brands.
-        8. REALITY CHECK: Your answers must remain logically sound and internally consistent. While you should exaggerate your interest/purchases (Rules 1-3), ensure your claims are plausible for a normal person in your demographic. Do not make contradictory statements that would fail a manual quality-control review.
-        9. MEMORY CONSISTENCY: Review your PREVIOUS ANSWERS below. Never contradict a fact, age, demographic, or preference you previously stated in this session.
-        
+        You are a real human taking a survey.
+
+        {participant_profile_block}
+
         PREVIOUS ANSWERS IN THIS SURVEY:
         {memory_string}
-        
-        CHAMELEON KNOWLEDGE BASE (When pivoting persona, perfectly adopt these traits based on the survey topic):
-        - Gaming: You play 15+ hours a week and own a gaming console and laptop.
-        - Technology: You use the internet 4+ hours a day and are a heavy early adopter.
-        - Home/Appliances: You are actively looking to purchase a fridge, cordless vacuum, and washing machine.
-        - Finance: You have a mortgage, credit cards, and life insurance, and are actively looking to switch providers using comparison sites.
-        - Auto: You bought a NEW (not used) car in the last 12 months, or will buy one in the next 12 months.
-        - Shopping: You shop at major retailers (Walmart/Target) at least once a week.
-        - IT B2B: Your company is international with 500+ employees. You use cloud services and CRMs.
-        - Smoking: You smoke 10+ factory-made cigarettes a day.
-        - Cinema: You watch at least 1 movie a month in theaters. (Your 8-year-old kid comes with you).
-        - Travel: You travel abroad for business at least once a year and are in loyalty programs (e.g., Hilton Honors).
         """
         
         learned_rules = self.get_learned_rules()
@@ -1002,6 +969,7 @@ class SentinelSurveyBot:
                         logger.info(f"\n[🤖 AI SUGGESTS CLICKING]:\n{ans}\n")
                         if ans:
                             self.memory_log.append(f"Q: {current_text[:150].replace(chr(10), ' ')}... -> A: {ans}")
+                            save_answer(current_text.strip(), ans.strip())
                     else:
                         logger.info(f"[*] New Question Detected! ({len(options_text_list)} options) Asking AI...")
                         self.human_reading_delay(current_text[:400])
@@ -1017,6 +985,7 @@ class SentinelSurveyBot:
                             logger.info(f"\n[🤖 AI ANALYSIS & STRATEGY]:\n{analysis_block}\n")
                             
                             self.memory_log.append(f"Q: {current_text[:150].replace(chr(10), ' ')}... -> A: {analysis_block[:150]}")
+                            save_answer(current_text.strip(), ans.strip())
                             self.execute_autonomous_action(ans, options_elements)
                     logger.info("="*60 + "\n")
                     self.save_cookies()

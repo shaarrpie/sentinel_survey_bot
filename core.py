@@ -11,13 +11,21 @@ from typing import List, Optional, Literal
 from urllib.parse import urlparse
 
 from openai import OpenAI
-from playwright.sync_api import sync_playwright, Page
+from openai import APITimeoutError, APIConnectionError, APIStatusError
 from pydantic import BaseModel, Field
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.keys import Keys
 
 from answer_cache import AnswerCache
 
 import logging
 logger = logging.getLogger(__name__)
+
+DECIDE_PROVIDER_TIMEOUT = 15.0   # seconds; well under the bot's 45s /decide budget
 
 # ── survey-routing / panel login hubs ──────────────────────────────
 # Domains come from panel_config.json, which the extension popup edits at
@@ -55,115 +63,56 @@ class BrowserController:
     def __init__(self, headless: bool = False, slow_mo: int = 50, profile_dir: str = "profiles/default"):
         self.headless = headless
         self.slow_mo = slow_mo
-        self.profile_dir = profile_dir
-        self._pw = None
-        self._browser = None
-        self._context = None
-        self.page: Page = None
+        self.profile_dir = os.path.abspath(profile_dir)
+        os.makedirs(self.profile_dir, exist_ok=True)
+        self.driver = None
+        self.disqualified = False
 
     def start(self):
-        self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(
-            headless=self.headless,
-            slow_mo=self.slow_mo,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-                "--window-size=1366,768",
-                "--disable-dev-shm-usage",
-                "--no-sandbox",
-            ]
-        )
-        self._context = self._browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-            locale="en-US",
-            timezone_id="America/New_York",
-            geolocation={"latitude": 40.7128, "longitude": -74.0060},
-            permissions=["geolocation"],
-        )
-        self.page = self._context.new_page()
-        self.page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            window.chrome = { runtime: {} };
-        """)
-        # Load cookies + storage AFTER page exists
-        self._load_session()
-        self._inject_cookies()
-        self._install_storage_restore()
-        
-        # Network interception for early disqualification detection
-        self.disqualified = False
-        self.page.on("response", lambda response: self._check_response(response))
+        options = uc.ChromeOptions()
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--disable-infobars")
+        options.add_argument("--disable-notifications")
+        options.add_argument("--window-size=1280,800")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--no-sandbox")
 
-    def _check_response(self, response):
         try:
-            url = response.url.lower()
-            if (any(x in url for x in ["disqualified", "screenout", "terminate", "quota_full"])
-                    or is_survey_router_hub(url)):
+            self.driver = uc.Chrome(options=options, user_data_dir=self.profile_dir)
+        except Exception:
+            fallback = os.path.join(self.profile_dir, "_chrome_tmp")
+            os.makedirs(fallback, exist_ok=True)
+            opts = uc.ChromeOptions()
+            opts.add_argument("--disable-blink-features=AutomationControlled")
+            opts.add_argument("--disable-infobars")
+            opts.add_argument("--disable-notifications")
+            opts.add_argument("--window-size=1280,800")
+            opts.add_argument("--disable-dev-shm-usage")
+            opts.add_argument("--no-sandbox")
+            self.driver = uc.Chrome(options=opts, user_data_dir=fallback)
+
+        self.driver.set_window_position(0, 0)
+        self.driver.set_window_size(1280, 800)
+
+        self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        })
+
+        self.driver.request_interceptor = self._intercept
+
+    def _intercept(self, request):
+        try:
+            url = (request.url or "").lower()
+            if any(x in url for x in ["disqualified", "screenout", "terminate", "quota_full"]):
                 self.disqualified = True
-        except Exception as e:
-            print(f"[!] Response check error: {e}")
-
-    def _load_session(self):
-        profile_dir = Path(self.profile_dir)
-        profile_dir.mkdir(parents=True, exist_ok=True)
-        
-        cookies_path = profile_dir / "cookies.json"
-        storage_path = profile_dir / "storage.json"
-        
-        if cookies_path.exists():
-            try:
-                with open(cookies_path, "r", encoding="utf-8") as f:
-                    cookies = json.load(f)
-                self._pending_cookies = cookies
-            except Exception:
-                self._pending_cookies = None
-        else:
-            self._pending_cookies = None
-        
-        if storage_path.exists():
-            try:
-                with open(storage_path, "r", encoding="utf-8") as f:
-                    storage = json.load(f)
-                self._pending_storage = storage
-            except Exception:
-                self._pending_storage = None
-        else:
-            self._pending_storage = None
-
-    def _install_storage_restore(self):
-        """Storage is origin-scoped, so it must execute inside the
-        real document — an init script runs before the page's own
-        scripts on every navigation, including the first."""
-        if not getattr(self, "_pending_storage", None):
-            return
-        payload = json.dumps(self._pending_storage)
-        script = (
-            "(() => {"
-            f"  const data = {payload};"
-            "  try {"
-            "    if (data.local) for (const [k, v] of Object.entries(data.local))"
-            "      localStorage.setItem(k, v);"
-            "    if (data.session) for (const [k, v] of Object.entries(data.session))"
-            "      sessionStorage.setItem(k, v);"
-            "  } catch (e) {}"
-            "})();"
-        )
-        self.page.add_init_script(script)
-
-    def _inject_cookies(self):
-        if hasattr(self, '_pending_cookies') and self._pending_cookies:
-            try:
-                self.page.context.add_cookies(self._pending_cookies)
-            except Exception as e:
-                print(f"[!] Failed to inject cookies: {e}")
+        except Exception:
+            pass
 
     def screenshot_b64(self, compress: bool = True) -> str:
-        png_bytes = self.page.screenshot(type="png")
+        png = self.driver.get_screenshot_as_png()
         if compress:
-            png_bytes = self._compress_screenshot(png_bytes)
-        return base64.b64encode(png_bytes).decode()
+            png = self._compress_screenshot(png)
+        return base64.b64encode(png).decode()
 
     def _compress_screenshot(self, png_bytes: bytes, max_size_kb: int = 500) -> bytes:
         try:
@@ -182,7 +131,7 @@ class BrowserController:
             return png_bytes
 
     def get_element_map(self) -> List[dict]:
-        return self.page.evaluate("""() => {
+        return self.driver.execute_script("""() => {
             const elements = [];
             document.querySelectorAll(
                 'button, input, select, textarea, a, [role="button"], [role="radio"], [role="checkbox"], label, .answer-option, .survey-option'
@@ -206,31 +155,34 @@ class BrowserController:
         }""")
 
     def get_page_text(self) -> str:
-        return self.page.inner_text("body")
+        return self.driver.find_element(By.TAG_NAME, "body").text
 
     def get_url(self) -> str:
-        return self.page.url
+        return self.driver.current_url
 
     def click_element(self, element_id: int):
         sel = f"[data-bot-id='{element_id}']"
-        self.page.locator(sel).scroll_into_view_if_needed()
-        self.page.locator(sel).click()
+        el = self.driver.find_element(By.CSS_SELECTOR, sel)
+        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        el.click()
 
     def click_coords(self, x: int, y: int):
-        self.page.mouse.click(x, y)
+        ActionChains(self.driver).move_by_offset(x, y).click().perform()
 
     def type_into(self, element_id: int, text: str, human_like: bool = True):
         sel = f"[data-bot-id='{element_id}']"
-        el = self.page.locator(sel)
-        el.scroll_into_view_if_needed()
-        el.fill("")
+        el = self.driver.find_element(By.CSS_SELECTOR, sel)
+        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        el.clear()
         if human_like:
-            el.press_sequentially(text, delay=random.randint(30, 120))
+            for ch in text:
+                el.send_keys(ch)
+                time.sleep(random.randint(30, 120) / 1000)
         else:
-            el.fill(text)
+            el.send_keys(text)
 
     def scroll_random(self):
-        self.page.mouse.wheel(0, random.randint(200, 600))
+        self.driver.execute_script(f"window.scrollBy(0, {random.randint(200, 600)});")
 
     def detect_captcha(self) -> Optional[str]:
         indicators = [
@@ -240,16 +192,20 @@ class BrowserController:
             ".g-recaptcha",
             "#recaptcha",
             ".h-captcha",
-            "text=I'm not a robot",
-            "text=Verify you are human",
         ]
         for sel in indicators:
             try:
-                loc = self.page.locator(sel).first
-                if loc.count() > 0 and loc.is_visible():
+                els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                if els and els[0].is_displayed():
                     return sel
             except Exception:
                 continue
+        try:
+            body = self.driver.find_element(By.TAG_NAME, "body").text.lower()
+            if "i'm not a robot" in body or "verify you are human" in body:
+                return "text"
+        except Exception:
+            pass
         return None
 
     def handle_captcha(self):
@@ -262,120 +218,56 @@ class BrowserController:
 
     def click_next(self) -> bool:
         selectors = [
-            "button:has-text('Next')", "button:has-text('Continue')",
-            "button:has-text('Submit')", "input[type='submit']",
+            "button:contains('Next')", "button:contains('Continue')",
+            "button:contains('Submit')", "input[type='submit']",
             "[id*='Next' i]", "[class*='next' i]", "[class*='continue' i]",
-            "button:has-text('>>')", "button:has-text('→')"
         ]
         for sel in selectors:
             try:
-                el = self.page.locator(sel).first
-                if el.is_visible(timeout=500):
-                    el.scroll_into_view_if_needed()
-                    el.click()
-                    return True
+                els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                for el in els:
+                    if el.is_displayed() and el.is_enabled():
+                        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                        el.click()
+                        return True
             except Exception:
                 continue
         return False
 
     def goto(self, url: str):
-        self.page.goto(url, wait_until="domcontentloaded")
+        self.driver.get(url)
 
     def is_disqualified(self) -> bool:
-        url = self.page.url.lower()
-        text = self.page.inner_text("body").lower()[:2000]
+        url = (self.driver.current_url or "").lower()
+        try:
+            text = self.driver.find_element(By.TAG_NAME, "body").text.lower()[:2000]
+        except Exception:
+            text = ""
         flags = ["disqualified", "screenout", "not qualify", "quota full", "reward=0", "terminated"]
         return any(f in url or f in text for f in flags) or is_survey_router_hub(url)
 
     def is_completion(self) -> bool:
-        text = self.page.inner_text("body").lower()[:1500]
+        try:
+            text = self.driver.find_element(By.TAG_NAME, "body").text.lower()[:1500]
+        except Exception:
+            text = ""
         return any(x in text for x in ["thank you", "completed", "finished", "success", "your responses have been recorded"])
 
     def save_session(self):
-        profile_dir = Path(self.profile_dir)
-        profile_dir.mkdir(parents=True, exist_ok=True)
-        
-        cookies = self.page.context.cookies()
-        with open(profile_dir / "cookies.json", "w", encoding="utf-8") as f:
-            json.dump(cookies, f, indent=2)
-        
-        storage = self.page.evaluate("""
-            () => ({
-                local: Object.fromEntries(Object.entries(localStorage)),
-                session: Object.fromEntries(Object.entries(sessionStorage))
-            })
-        """)
-        with open(profile_dir / "storage.json", "w", encoding="utf-8") as f:
-            json.dump(storage, f, indent=2)
+        pass
 
     def load_session(self):
-        profile_dir = Path(self.profile_dir)
-        cookies_path = profile_dir / "cookies.json"
-        storage_path = profile_dir / "storage.json"
-        
-        if cookies_path.exists():
-            try:
-                with open(cookies_path, "r", encoding="utf-8") as f:
-                    cookies = json.load(f)
-                self.page.context.add_cookies(cookies)
-            except Exception:
-                pass
-        
-        if storage_path.exists():
-            try:
-                with open(storage_path, "r", encoding="utf-8") as f:
-                    storage = json.load(f)
-                self.page.evaluate("""
-                    (data) => {
-                        if (data.local) {
-                            Object.entries(data.local).forEach(([k, v]) => localStorage.setItem(k, v));
-                        }
-                        if (data.session) {
-                            Object.entries(data.session).forEach(([k, v]) => sessionStorage.setItem(k, v));
-                        }
-                    }
-                """, storage)
-            except Exception:
-                pass
+        pass
 
     def stop(self):
-        if self._context:
+        if self.driver:
             try:
-                self.save_session()
-            except Exception:
-                pass
-            try:
-                self._context.close()
-            except Exception:
-                pass
-        if self._browser:
-            try:
-                self._browser.close()
-            except Exception:
-                pass
-        if self._pw:
-            try:
-                self._pw.stop()
+                self.driver.quit()
             except Exception:
                 pass
 
 class AIEngine:
-    PERSONA = """You are a real human taking online surveys. Persona:
-- Female, 32, Mumbai (Maharashtra), India, Pin 400001
-- B.Tech/MBA, IT Director, household income ₹12L
-- Married, 2 kids (4, 7), caregiver for elderly parent (diabetes, hypertension)
-- 2 dogs, 2 cats, urban homeowner
-- Primary decision-maker for FMCG, groceries, education, appliances
-
-STRICT RULES:
-1. NEVER say you work in Marketing/Advertising/Market Research. Pick "None of the above" or "Other: Engineering".
-2. ALWAYS express extreme interest in products/topics asked about.
-3. For multi-select purchase questions, select ALMOST ALL except obvious fake/trap items.
-4. ALWAYS claim to be the sole/final decision-maker.
-5. If the survey targets a niche (healthcare, gaming, auto), PIVOT your persona to match it perfectly.
-6. Follow instruction traps literally (e.g., "Select option 3").
-7. Never contradict previous answers. Use memory to stay consistent.
-8. Keep answers plausible and internally consistent."""
+    from participant_profile import get_persona
 
     COMMON_ANSWERS = {
         "age": "32",
@@ -391,7 +283,12 @@ STRICT RULES:
     }
 
     def __init__(self, api_key: str, base_url: str, model: str):
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.client = OpenAI(
+            base_url=base_url,
+            api_key=api_key or "not-needed",
+            timeout=DECIDE_PROVIDER_TIMEOUT,
+            max_retries=1,
+        )
         self.model = model
         self.memory: List[str] = []
         self.learned_rules: List[str] = []
@@ -461,7 +358,7 @@ Instructions:
             resp = self.client.beta.chat.completions.parse(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": self.PERSONA},
+                    {"role": "system", "content": self.get_persona()},
                     {"role": "user", "content": [
                         {"type": "text", "text": prompt_text},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}}
@@ -473,11 +370,23 @@ Instructions:
             )
             return resp.choices[0].message.parsed
 
+        except APITimeoutError:
+            logger.warning("provider timed out after %.0fs -> heuristic fallback",
+                           DECIDE_PROVIDER_TIMEOUT)
+        except APIConnectionError as e:
+            logger.warning("provider unreachable (%s) -> heuristic fallback", e)
+        except APIStatusError as e:
+            logger.warning("provider error %s: %s -> heuristic fallback",
+                           e.status_code, str(e)[:200])
         except Exception:
+            pass
+
+        # Fallback: try JSON-mode create()
+        try:
             resp = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": self.PERSONA},
+                    {"role": "system", "content": self.get_persona()},
                     {"role": "user", "content": [
                          {"type": "text", "text": prompt_text + "\n\nYou MUST respond with valid JSON matching this schema:\n" + SurveyDecision.model_json_schema()},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}}
@@ -490,6 +399,30 @@ Instructions:
             if "```json" in raw:
                 raw = raw.split("```json")[1].split("```")[0]
             return SurveyDecision.model_validate_json(raw)
+
+        except APITimeoutError:
+            logger.warning("provider timed out after %.0fs -> heuristic fallback",
+                           DECIDE_PROVIDER_TIMEOUT)
+        except APIConnectionError as e:
+            logger.warning("provider unreachable (%s) -> heuristic fallback", e)
+        except APIStatusError as e:
+            logger.warning("provider error %s: %s -> heuristic fallback",
+                           e.status_code, str(e)[:200])
+        except Exception:
+            pass
+
+        # Final fallback: heuristic
+        heuristic_actions = self.try_heuristic(page_text, [e.get("text", "") for e in elements], elements)
+        if heuristic_actions:
+            print(f"[heuristic] Fallback for: {page_text[:60]}...")
+            return SurveyDecision(
+                page_summary="heuristic",
+                question_type="unknown",
+                confidence=1.0,
+                actions=heuristic_actions,
+                memory_note="heuristic answer"
+            )
+        return None
 
     def learn_from_disqualification(self, memory: List[str]):
         if not memory:
@@ -504,6 +437,14 @@ Instructions:
             rule = resp.choices[0].message.content.strip()
             if rule:
                 self.learned_rules.append(rule)
+        except APITimeoutError:
+            logger.warning("provider timed out after %.0fs -> learn_from_disqualification fallback",
+                           DECIDE_PROVIDER_TIMEOUT)
+        except APIConnectionError as e:
+            logger.warning("provider unreachable (%s) -> learn_from_disqualification fallback", e)
+        except APIStatusError as e:
+            logger.warning("provider error %s: %s -> learn_from_disqualification fallback",
+                           e.status_code, str(e)[:200])
         except Exception:
             pass
 
@@ -527,7 +468,7 @@ class SurveyBot:
         try:
             import imagehash
             from PIL import Image
-            png_bytes = self.browser.page.screenshot(type="png")
+            png_bytes = self.browser.driver.get_screenshot_as_png()
             img = Image.open(io.BytesIO(png_bytes))
             return str(imagehash.average_hash(img))
         except Exception:
@@ -547,7 +488,7 @@ class SurveyBot:
 
     def _handle_stuck(self):
         print("[!] Page hasn't changed in 40s — taking debug screenshot")
-        self.browser.page.screenshot(path=f"debug_stuck_{self.screenshot_counter}.png")
+        self.browser.driver.save_screenshot(f"debug_stuck_{self.screenshot_counter}.png")
         self.screenshot_counter += 1
         if self.browser.click_next():
             print("[+] Emergency Next clicked")
@@ -564,7 +505,46 @@ class SurveyBot:
         self.browser.start()
         self.browser.goto(url)
         print(f"[+] Loaded: {url}")
+        self._run_survey_loop()
 
+    def run_interactive(self):
+        self.browser.start()
+        print("[+] Browser opened. Navigate to the survey, then press F12 to start.")
+        print("    Press Ctrl+C in this terminal to stop.")
+
+        started = False
+        while True:
+            time.sleep(0.5)
+            try:
+                driver = self.browser.driver
+                if driver and not started:
+                    url = driver.current_url
+                    if not url or url == "about:blank":
+                        continue
+
+                    driver.execute_script("""
+                        if (!window.__sentinelKeyListenerInstalled) {
+                            window.__sentinelKeyListenerInstalled = true;
+                            window.__sentinelStartKey = null;
+                            document.addEventListener('keydown', function(e) {
+                                window.__sentinelStartKey = e.key;
+                            }, true);
+                        }
+                    """)
+                    last_key = driver.execute_script("return window.__sentinelStartKey;")
+                    if last_key == "F12":
+                        started = True
+                        print(f"[+] F12 detected on {url} — starting survey loop")
+                        self._run_survey_loop()
+                        started = False
+                        driver.execute_script("window.__sentinelStartKey = null;")
+                        print("[+] Survey loop ended. Navigate to another page and press F12 again.")
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                pass
+
+    def _run_survey_loop(self):
         while True:
             time.sleep(1.5)
 
@@ -594,7 +574,6 @@ class SurveyBot:
             cached = self.cache.get(page_text[:500], options_texts)
             if cached:
                 print(f"[cache] Cached answer found: {cached[:120]}")
-                # Re-prompt AI with cached answer context to get fresh element IDs
                 page_text += f"\n\n[CONTEXT: You previously answered this question with: {cached}. Use the same answer.]"
                 decision = self.ai.decide(screenshot, elements, current_url, page_text)
             else:

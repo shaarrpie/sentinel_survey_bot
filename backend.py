@@ -276,21 +276,7 @@ class SurveyDecision(BaseModel):
 
 # ── persona / memory / rules (unchanged) ─────────────────────────
 
-PERSONA = """You are a real human taking online surveys. Persona:
-- Female, 32, Mumbai (Maharashtra), India, Pin 400001
-- B.Tech/MBA, IT Director, household income ₹12L
-- Married, 2 kids (4, 7), caregiver for elderly parent (diabetes, hypertension)
-- 2 dogs, 2 cats, urban homeowner
-- Primary decision-maker for FMCG, groceries, education, appliances
-
-STRICT RULES:
-1. NEVER say you work in Marketing/Advertising/Market Research.
-2. ALWAYS express extreme interest in products/topics.
-3. For multi-select, select ALMOST ALL except obvious fake/trap items.
-4. ALWAYS claim to be the sole/final decision-maker.
-5. If survey targets a niche, PIVOT persona to match it.
-6. Follow instruction traps literally.
-7. Never contradict previous answers."""
+from participant_profile import get_persona
 
 MEMORY: dict = {}
 SESSION_LAST_SEEN: dict = {}
@@ -823,22 +809,29 @@ async def decide(req: DecideRequest):
     rules_block = ("\n".join(f"- {r}" for r in LEARNED_RULES)
                    if LEARNED_RULES else "None yet.")
 
-    prompt = f"""Analyze the survey screenshot and element map. Decide the next action(s).
+    prompt = f"""You are a survey completion assistant. Answer EVERY visible unanswered question on this page in a SINGLE response.
+
+Rules:
+- Return actions for ALL questions you can see, not just one.
+- Use click for radio/checkbox/button, type for text inputs, select_option for dropdowns, next to advance.
+- For radios, pick the best option per group. For checkboxes, select all that apply unless "none" is appropriate.
+- Do not ask for clarification or request more info.
+- Return JSON matching the SurveyDecision schema.
 
 URL: {req.url}
-Page text: {req.page_text[:2500]}
-Elements: {json.dumps(req.elements[:40])}
+Page text: {req.page_text[:3000]}
+Elements: {json.dumps(req.elements[:80])}
 Memory: {memory_block}
 Rules: {rules_block}{iframe_hint}
 
-Return JSON matching the SurveyDecision schema."""
+Return JSON matching the SurveyDecision schema with actions for ALL visible questions."""
 
     rec["prompt"] = prompt
     rec["rules"] = list(LEARNED_RULES)
     rec["memory_ctx"] = list(MEMORY[session_id][-12:])
     rec["model"] = MODEL
     _last_debug.update({"ts": rec["ts"], "url": req.url, "prompt": prompt,
-                        "persona": PERSONA, "model": MODEL})
+                        "persona": get_persona(), "model": MODEL})
 
     try:
         try:
@@ -848,7 +841,7 @@ Return JSON matching the SurveyDecision schema."""
                 resp = client.beta.chat.completions.parse(
                     model=MODEL,
                     messages=[
-                        {"role": "system", "content": PERSONA},
+                            {"role": "system", "content": get_persona()},
                         {"role": "user", "content": [
                             {"type": "text", "text": prompt},
                             {"type": "image_url",
@@ -881,7 +874,7 @@ Return JSON matching the SurveyDecision schema."""
                     resp = client.chat.completions.create(
                         model=MODEL,
                         messages=[
-                            {"role": "system", "content": PERSONA},
+                        {"role": "system", "content": get_persona()},
                             {"role": "user", "content": [
                                 {"type": "text", "text": prompt},
                                 {"type": "image_url",

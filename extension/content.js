@@ -6,7 +6,8 @@ if (window.__sentinelContentLoaded) {
 } else {
 window.__sentinelContentLoaded = true;
 
-const SCAN_INTERVAL = 2000;
+const SCAN_INTERVAL = 15000;
+let lastScanAt = 0;
 
 // Every log line carries an explicit severity tag so the popup never has to
 // regex-sniff its own output (audit round one, section B). An untagged first
@@ -61,6 +62,53 @@ window.__sentinel.debug = () => ({
     elements: lastMapDebug.elements,
     census: lastMapDebug.census,
 });
+
+// F12 console controls — LO can type these in devtools to start/stop the bot.
+window.__sentinel.start = async function() {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) { console.warn('[Sentinel] no active tab'); return; }
+    const runId = Date.now();
+    const resp = await new Promise(resolve =>
+        chrome.tabs.sendMessage(tab.id, { action: 'START', runId }, r => {
+            void chrome.runtime.lastError; resolve(r || null);
+        }));
+    if (!resp) {
+        console.warn('[Sentinel] no content script — reload the page and try again');
+        return;
+    }
+    console.log(`[Sentinel] started on tab ${tab.id} (build ${resp.build || '?'})`);
+};
+window.__sentinel.stop = async function() {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) { console.warn('[Sentinel] no active tab'); return; }
+    await chrome.tabs.sendMessage(tab.id, { action: 'STOP' }, () => {
+        void chrome.runtime.lastError;
+    });
+    console.log('[Sentinel] stop signal sent');
+};
+window.__sentinel.toggle = async function() {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) { console.warn('[Sentinel] no active tab'); return; }
+    const resp = await new Promise(resolve =>
+        chrome.tabs.sendMessage(tab.id, { action: 'GET_RUN_STATE' }, r => {
+            void chrome.runtime.lastError; resolve(r || null);
+        }));
+    if (resp && resp.running) {
+        await window.__sentinel.stop();
+    } else {
+        await window.__sentinel.start();
+    }
+};
+window.__sentinel.status = async function() {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab) { console.warn('[Sentinel] no active tab'); return; }
+    const resp = await new Promise(resolve =>
+        chrome.tabs.sendMessage(tab.id, { action: 'GET_RUN_STATE' }, r => {
+            void chrome.runtime.lastError; resolve(r || null);
+        }));
+    console.log('[Sentinel] run state:', resp || 'no response');
+    return resp;
+};
 
 // ─── Stats ────────────────────────────────────────────────────────
 let questionCount = 0;
@@ -840,6 +888,13 @@ async function scan(tabId) {
         return;
     }
     isScanning = true;
+    const now = Date.now();
+    if (now - lastScanAt < SCAN_INTERVAL) {
+        isScanning = false;
+        loopId = setTimeout(() => scan(tabId), SCAN_INTERVAL - (now - lastScanAt));
+        return;
+    }
+    lastScanAt = now;
 
     try {
         // Hub check FIRST — before visibility/DQ/captcha — so a panel login

@@ -37,11 +37,7 @@ def main() -> None:
         profile_name="default",
     )
     try:
-        url = input("[?] Survey URL: ").strip()
-        if not url.startswith(("http://", "https://")):
-            print("[-] Invalid URL")
-            return
-        bot.run(url)
+        bot.run_interactive()
     except KeyboardInterrupt:
         print("\n[!] Stopped by user")
     finally:
