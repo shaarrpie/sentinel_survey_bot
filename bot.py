@@ -1013,10 +1013,10 @@ class SentinelSurveyBot:
                                 logger.warning(f"  {idx}. {opt}")
                         logger.warning("----------------------------------------\n")
                 
-                if current_text and current_fingerprint != last_fingerprint and len(current_text) > 10:
-                    last_fingerprint = current_fingerprint
-                    fingerprint_since = time.time()
-                    screenshot_taken_for_current = False
+                    if current_text and current_fingerprint != last_fingerprint and len(current_text) > 10:
+                        last_fingerprint = current_fingerprint
+                        fingerprint_since = time.time()
+                        screenshot_taken_for_current = False
                     
                     image_context = ""
                     try:
@@ -1111,14 +1111,14 @@ class SentinelSurveyBot:
                     logger.info("="*60 + "\n")
                     self.save_cookies()
                     
-            except Exception as e:
-                err_type = type(e).__name__
-                if err_type not in ["StaleElementReferenceException", "NoSuchElementException", "NoSuchWindowException", "WebDriverException"]:
-                    logger.debug(f"[-] HUD Loop error: {e}")
-                pass
-        except KeyboardInterrupt:
-            logger.info("\n[!] Interrupted by user (Ctrl+C)")
-        finally:
+                except Exception as e:
+                    err_type = type(e).__name__
+                    if err_type not in ["StaleElementReferenceException", "NoSuchElementException", "NoSuchWindowException", "WebDriverException"]:
+                        logger.debug(f"[-] HUD Loop error: {e}")
+                    pass
+                except KeyboardInterrupt:
+                    logger.info("\n[!] Interrupted by user (Ctrl+C)")
+            finally:
             # Graceful shutdown: save cookies and cleanup
             logger.info("[*] Shutting down gracefully...")
             try:
