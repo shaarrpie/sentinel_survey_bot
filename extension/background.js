@@ -101,14 +101,27 @@ function isDebuggerAttached(tabId) {
   });
 }
 
+// Attach race: two concurrent TRUSTED_CLICKs for the same tab both
+// observed "not attached" and both called chrome.debugger.attach; the
+// second rejects (debugger busy) and that click silently failed. One
+// in-flight attach per tab; callers share the promise.
+const attachPromises = new Map();
+function ensureDebuggerAttached(tabId) {
+  if (!attachPromises.has(tabId)) {
+    attachPromises.set(tabId,
+      isDebuggerAttached(tabId).then((attached) => attached ? true :
+        new Promise((res, rej) => chrome.debugger.attach(
+          { tabId }, '1.3',
+          () => chrome.runtime.lastError
+            ? rej(chrome.runtime.lastError) : res(true))))
+        .finally(() => attachPromises.delete(tabId)));
+  }
+  return attachPromises.get(tabId);
+}
+
 async function trustedMouseClick(tabId, vp) {
   try {
-    if (!await isDebuggerAttached(tabId)) {
-      await new Promise((res, rej) =>
-        chrome.debugger.attach({ tabId }, '1.3',
-          () => chrome.runtime.lastError
-            ? rej(chrome.runtime.lastError) : res()));
-    }
+    await ensureDebuggerAttached(tabId);
     const tx = Math.round(vp.x + (Math.random() - 0.5) * vp.w * 0.64);
     const ty = Math.round(vp.y + (Math.random() - 0.5) * vp.h * 0.64);
     const start = lastPointer.get(tabId) ||
@@ -403,7 +416,34 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 chrome.debugger.onDetach.addListener((source) => {
     // infobar "Cancel", tab crash, or devtools took over — forget stale memory
+    attachPromises.delete(source.tabId);
     lastPointer.delete(source.tabId);
+});
+
+// Content scripts are injected on demand now (no <all_urls> manifest
+// entry), so a hard navigation on the run tab leaves it without the
+// listener that performs auto-resume. Re-inject when that tab finishes
+// loading; content.js's re-injection guard makes duplicates a no-op.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status !== 'complete') return;
+  chrome.storage.session.get('runState', (result) => {
+    const runState = (result && result.runState) || null;
+    if (!runState || !runState.running || runState.tabId !== tabId) return;
+    chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError || !tab ||
+          !/^https?:/.test(tab.url || '')) return;
+      chrome.scripting.executeScript({
+        target: { tabId },
+        files: ['content.js']
+      }).catch((e) => {
+        logs.push({ t: Date.now(),
+                    line: 're-inject after navigation failed: ' + e.message,
+                    kind: 'warn' });
+        if (logs.length > MAX_LOGS) logs = logs.slice(-MAX_LOGS);
+        saveLogs();
+      });
+    });
+  });
 });
 
 chrome.commands.onCommand.addListener((command) => {

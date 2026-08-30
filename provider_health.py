@@ -11,7 +11,10 @@ class ProviderHealth:
     """Cached health probe for an externally managed OpenAI-compatible API."""
 
     def __init__(self, base_url: str, api_key: str, model: str,
-                 cache_seconds: float = 2.0):
+                 cache_seconds: float = 30.0):
+        # 30s (was 2s): a working-but-slow router flapped between "up" and
+        # "demoted to heuristic" on every probe, and /decide paid a probe
+        # round trip on nearly every call.
         self.base_url = (base_url or "").rstrip("/")
         self.api_key = api_key or ""
         self.model = model or ""
@@ -50,7 +53,7 @@ class ProviderHealth:
             response = httpx.get(
                 f"{self.base_url}/models",
                 headers=headers,
-                timeout=2.0,
+                timeout=5.0,   # was 2.0 — slow-but-alive routers were being demoted
                 follow_redirects=True,
             )
             result["status_code"] = response.status_code

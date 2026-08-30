@@ -19,7 +19,7 @@ class TraceBus:
     MAX = 1000
 
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()   # RLock: note_omni_call nests note_omni_latency
         self._buf = []                        # newest last
         self._seq = itertools.count(1)
         self.boot_id = uuid.uuid4().hex[:8]
@@ -72,47 +72,61 @@ class TraceBus:
             return last, out
 
     def note_omni_latency(self, ms, ok, err=None, provider=None, model=None):
-        o = self.omni
-        o["calls"] += 1
-        o["last_ms"] = round(ms, 1)
-        o["last_call_at"] = time.time()
-        if provider:
-            o["provider"] = provider
-        if model:
-            o["model"] = model
-        if not ok:
-            o["errors"] += 1
-            o["last_error"] = err
-        self._lat.append(ms)
-        if len(self._lat) > 200:
-            del self._lat[: len(self._lat) - 200]
-        s = sorted(self._lat)
-        o["p50_ms"] = round(s[len(s) // 2], 1)
+        with self._lock:
+            o = self.omni
+            o["calls"] += 1
+            o["last_ms"] = round(ms, 1)
+            o["last_call_at"] = time.time()
+            if provider:
+                o["provider"] = provider
+            if model:
+                o["model"] = model
+            if not ok:
+                o["errors"] += 1
+                o["last_error"] = err
+            self._lat.append(ms)
+            if len(self._lat) > 200:
+                del self._lat[: len(self._lat) - 200]
+            s = sorted(self._lat)
+            o["p50_ms"] = round(s[len(s) // 2], 1)
 
     def note_omni_call(self, provider=None, model=None, ms=0, ok=True,
                        err=None, cycle=None, tokens_in=0, tokens_out=0):
         """Detail-panel feed: aggregates per-model stats, latency history and
         recent-call log on top of what note_omni_latency records."""
-        self.note_omni_latency(ms, ok, err, provider, model)   # base counters
-        m = model or "?"
-        md = self.omni["models"].setdefault(m, {
-            "calls": 0, "errors": 0, "total_ms": 0.0, "last_ms": None})
-        md["calls"] += 1
-        md["total_ms"] += ms
-        md["last_ms"] = round(ms, 1)
-        if not ok:
-            md["errors"] += 1
-        self.omni["tokens_in"] += tokens_in or 0
-        self.omni["tokens_out"] += tokens_out or 0
-        hist = self.omni["latency_history"]
-        hist.append(round(ms, 1))
-        if len(hist) > 20:
-            del hist[: len(hist) - 20]
-        rc = self.omni["recent_calls"]
-        rc.append({"t": time.time(), "cycle": cycle, "model": m,
-                   "ms": round(ms, 1), "ok": ok, "err": err})
-        if len(rc) > 20:
-            del rc[: len(rc) - 20]
+        with self._lock:
+            self.note_omni_latency(ms, ok, err, provider, model)   # base counters
+            m = model or "?"
+            md = self.omni["models"].setdefault(m, {
+                "calls": 0, "errors": 0, "total_ms": 0.0, "last_ms": None})
+            md["calls"] += 1
+            md["total_ms"] += ms
+            md["last_ms"] = round(ms, 1)
+            if not ok:
+                md["errors"] += 1
+            self.omni["tokens_in"] += tokens_in or 0
+            self.omni["tokens_out"] += tokens_out or 0
+            hist = self.omni["latency_history"]
+            hist.append(round(ms, 1))
+            if len(hist) > 20:
+                del hist[: len(hist) - 20]
+            rc = self.omni["recent_calls"]
+            rc.append({"t": time.time(), "cycle": cycle, "model": m,
+                       "ms": round(ms, 1), "ok": ok, "err": err})
+            if len(rc) > 20:
+                del rc[: len(rc) - 20]
+
+    def note_omni_ping(self, ping: dict):
+        """Store a /omni/ping result. Direct bus.omni["last_ping"] writes
+        from the endpoint raced snapshot(); everything goes through the
+        lock now."""
+        with self._lock:
+            self.omni["last_ping"] = ping
+
+    def get_omni(self) -> dict:
+        """Deep copy of the omni state, taken under the lock."""
+        with self._lock:
+            return copy.deepcopy(self.omni)
 
     def set_omni_health(self, *, loaded, model, base_url, error, api_key_set):
         with self._lock:
@@ -166,23 +180,35 @@ def omni_call(provider=None, model=None, cycle=None):
 def probe_omni(router_obj=None):
     """Call once at startup with your omni router instance. Adapts to
     common shapes: .status(), .provider/.model attrs, or a plain dict."""
-    o = bus.omni
-    try:
-        if router_obj is None:
-            raise RuntimeError("no router instance passed to probe_omni()")
-        info = router_obj.status() if hasattr(router_obj, "status") else {}
-        if isinstance(router_obj, dict):
-            info = router_obj
-        info = info or {}
-        o["loaded"] = True
-        o["provider"] = info.get("provider") or getattr(router_obj, "provider", None)
-        o["model"] = info.get("model") or getattr(router_obj, "model", None)
-        o["base_url"] = info.get("base_url") or getattr(router_obj, "base_url", None)
-        o["api_key_set"] = bool(info.get("api_key_set",
-                                         getattr(router_obj, "api_key", None)))
-    except Exception as e:
-        o["loaded"] = False
-        o["last_error"] = f"probe failed: {e}"
+    with bus._lock:
+        try:
+            if router_obj is None:
+                raise RuntimeError("no router instance passed to probe_omni()")
+            info = router_obj.status() if hasattr(router_obj, "status") else {}
+            if isinstance(router_obj, dict):
+                info = router_obj
+            info = info or {}
+            provider = info.get("provider") or getattr(router_obj, "provider", None)
+            model = info.get("model") or getattr(router_obj, "model", None)
+            base_url = info.get("base_url") or getattr(router_obj, "base_url", None)
+            api_key_set = bool(info.get("api_key_set",
+                                        getattr(router_obj, "api_key", None)))
+            # Was: o["loaded"] = True unconditionally — so /status'
+            # omni.loaded meant "we called probe once", not "the provider
+            # works". Now it means the router is actually wired
+            # (endpoint + key); /status overwrites it with live
+            # api_ready on every poll anyway.
+            loaded = bool(base_url and api_key_set)
+            bus.omni.update({
+                "loaded": loaded,
+                "provider": provider,
+                "model": model,
+                "base_url": base_url,
+                "api_key_set": api_key_set,
+            })
+        except Exception as e:
+            bus.omni["loaded"] = False
+            bus.omni["last_error"] = f"probe failed: {e}"
     bus.record("sys", "state",
                f"omni router {'LOADED' if o['loaded'] else 'NOT LOADED'}"
                + (f" — {o['provider']}/{o['model']}" if o["loaded"] else ""),

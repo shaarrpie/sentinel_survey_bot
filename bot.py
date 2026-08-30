@@ -92,14 +92,14 @@ class MouseController:
                 self.cdp("Browser.enable", {})
                 self._attached = True
             except Exception:
-                pass
+                logger.debug("swallowed exception in bot.py", exc_info=True)
 
     def _detach(self):
         if self._attached:
             try:
                 self.cdp("Browser.disable", {})
             except Exception:
-                pass
+                logger.debug("swallowed exception in bot.py", exc_info=True)
             self._attached = False
 
     def _bezier(self, x0, y0, x1, y1, n=12):
@@ -227,7 +227,7 @@ def check_keypress():
             if select.select([sys.stdin], [], [], 0)[0]:
                 return sys.stdin.read(1)
         except Exception:
-            pass
+            logger.debug("swallowed exception in bot.py", exc_info=True)
         return None
 
 
@@ -295,7 +295,6 @@ class SentinelSurveyBot:
             options.add_argument("--window-size=1280,800")
             # options.add_argument("--remote-debugging-port=9222") # MASSIVE RED FLAG FOR CINT/CLOUDFLARE
             options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--no-sandbox")
             options.add_argument("--disable-blink-features=AutomationControlled")
             
             if sweatshop_mode:
@@ -359,7 +358,7 @@ class SentinelSurveyBot:
                         self.driver.add_cookie(cookie)
                         count += 1
                     except Exception:
-                        pass
+                        logger.debug("swallowed exception in bot.py", exc_info=True)
                 if count > 0:
                     logger.info(f"[🍪 COOKIES] Injected {count} saved cookies (skipped {skipped} domain mismatches). Refreshing page...")
                     self.driver.refresh()
@@ -443,7 +442,7 @@ class SentinelSurveyBot:
             self.actions.move_to_element(element).perform()
             time.sleep(random.uniform(0.1, 0.4))
         except Exception:
-            pass
+            logger.debug("swallowed exception in bot.py", exc_info=True)
 
     def human_reading_delay(self, text):
         words = len(text.split())
@@ -613,7 +612,7 @@ class SentinelSurveyBot:
                     parent = ce.find_element(By.XPATH, "..")
                     parent_text = parent.text.lower()
                 except Exception:
-                    pass
+                    logger.debug("swallowed exception in bot.py", exc_info=True)
                 search_pool = f"{placeholder} {parent_text} {ce.get_attribute('id') or ''}".lower()
                 if label_keyword.lower() in search_pool:
                     best_input = ce
@@ -635,14 +634,14 @@ class SentinelSurveyBot:
                             lbl = self.driver.find_element(By.CSS_SELECTOR, f"label[for='{inp_id}']")
                             label_text = lbl.text.lower()
                         except Exception:
-                            pass
+                            logger.debug("swallowed exception in bot.py", exc_info=True)
                     
                     parent_text = ""
                     try:
                         parent = inp.find_element(By.XPATH, "..")
                         parent_text = parent.text.lower()
                     except Exception:
-                        pass
+                        logger.debug("swallowed exception in bot.py", exc_info=True)
                     
                     search_pool = f"{inp_id} {inp_name} {inp_placeholder} {label_text} {parent_text}".lower()
                     if label_keyword.lower() in search_pool:
@@ -692,7 +691,7 @@ class SentinelSurveyBot:
                         row = opt_el.find_element(By.XPATH, "./ancestor::tr")
                         opt_text = row.text.strip() + " - " + (opt_el.get_attribute("value") or "")
                     except Exception:
-                        pass
+                        logger.debug("swallowed exception in bot.py", exc_info=True)
                 
                 try:
                     rect = opt_el.rect
@@ -754,7 +753,7 @@ class SentinelSurveyBot:
                             logger.error(f"    [-] LLM coordinates X:{cx}, Y:{cy} out of viewport ({vp_w}x{vp_h}) - rejecting")
                             cx, cy = None
                     except Exception:
-                        pass
+                        logger.debug("swallowed exception in bot.py", exc_info=True)
                 
                 if cx is not None and cy is not None:
                     try:
@@ -911,7 +910,7 @@ class SentinelSurveyBot:
                                 self.driver.switch_to.window(handles[-1])
                                 logger.info(f"    [🗔 TAB SWITCH] Switched to new popup tab. Now at: {self.driver.current_url}")
                     except Exception:
-                        pass
+                        logger.debug("swallowed exception in bot.py", exc_info=True)
 
                     current_url = self.driver.current_url.lower()
                     if any(k in current_url for k in ["disqualified", "screenout", "reward=0", "&term="]):
@@ -1028,7 +1027,7 @@ class SentinelSurveyBot:
                                 if image_context:
                                     break
                     except Exception:
-                        pass
+                        logger.debug("swallowed exception in bot.py", exc_info=True)
                     
                     options_elements = []
                     options_text_list = []
@@ -1047,7 +1046,7 @@ class SentinelSurveyBot:
                                 row = el.find_element(By.XPATH, "./ancestor::tr")
                                 txt = row.text.strip() + " - " + (el.get_attribute("value") or "")
                             except Exception:
-                                pass
+                                logger.debug("swallowed exception in bot.py", exc_info=True)
                         
                         txt = txt.strip()
                         if txt:
@@ -1059,7 +1058,7 @@ class SentinelSurveyBot:
                                 coord_marker = f"X:{cx}, Y:{cy}"
                                 txt = f"{txt} {coord_marker}"
                             except Exception:
-                                pass
+                                logger.debug("swallowed exception in bot.py", exc_info=True)
                             
                             options_elements.append(el)
                             if raw_txt not in options_text_list:
@@ -1131,7 +1130,7 @@ class SentinelSurveyBot:
                     self.driver.quit()
                     logger.info("[+] Browser closed.")
             except Exception:
-                pass
+                logger.debug("swallowed exception in bot.py", exc_info=True)
 
     def run(self, target_url):
         self.run_manual_hud(target_url)
@@ -1164,7 +1163,7 @@ def run_cli_mode():
                 try:
                     bot.driver.quit()
                 except Exception:
-                    pass
+                    logger.debug("swallowed exception in bot.py", exc_info=True)
                 break
                 
             if url.strip() == '':

@@ -20,30 +20,28 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
 
+# is_stuck() threshold — the log message used to say 40s while the code
+# checked 35s; one constant, one number.
+STUCK_THRESHOLD_SECONDS = 35
+
 from answer_cache import AnswerCache
+from participant_profile import get_persona
+from panel_config import host_matches_hubs as is_survey_router_hub
+from sentinel_heuristic import real_input_kind
 
 import logging
 logger = logging.getLogger(__name__)
 
-DECIDE_PROVIDER_TIMEOUT = 15.0   # seconds; well under the bot's 45s /decide budget
+# 30s to match the backend client; both sit under the 45s /decide budget
+# the extension enforces. (Was 15s here, 8s in backend.py, 45s in the
+# extension — three budgets, the tightest won.)
+DECIDE_PROVIDER_TIMEOUT = 30.0
 
 # ── survey-routing / panel login hubs ──────────────────────────────
 # Domains come from panel_config.json, which the extension popup edits at
 # runtime via POST /config/panel-hub. Read LIVE on every call so updates
 # apply without a backend restart.
 from panel_config import get_panel_hub_domains
-
-def is_survey_router_hub(url: str) -> bool:
-    try:
-        u = (url or "").lower().strip()
-        host = urlparse(u).netloc or u
-    except Exception:
-        host = (url or "").lower()
-    if host.startswith("www."):
-        host = host[4:]          # leading label only — matches hub_match.js
-    host = host.split(":")[0]
-    return any(host == d or host.endswith("." + d)
-               for d in get_panel_hub_domains())
 
 class Action(BaseModel):
     action_type: Literal["click", "type", "select_option", "select_multi", "scroll", "next", "wait", "human_help"]
@@ -75,7 +73,6 @@ class BrowserController:
         options.add_argument("--disable-notifications")
         options.add_argument("--window-size=1280,800")
         options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--no-sandbox")
 
         try:
             self.driver = uc.Chrome(options=options, user_data_dir=self.profile_dir)
@@ -88,7 +85,6 @@ class BrowserController:
             opts.add_argument("--disable-notifications")
             opts.add_argument("--window-size=1280,800")
             opts.add_argument("--disable-dev-shm-usage")
-            opts.add_argument("--no-sandbox")
             self.driver = uc.Chrome(options=opts, user_data_dir=fallback)
 
         self.driver.set_window_position(0, 0)
@@ -106,7 +102,7 @@ class BrowserController:
             if any(x in url for x in ["disqualified", "screenout", "terminate", "quota_full"]):
                 self.disqualified = True
         except Exception:
-            pass
+            logger.debug("swallowed exception in core.py", exc_info=True)
 
     def screenshot_b64(self, compress: bool = True) -> str:
         png = self.driver.get_screenshot_as_png()
@@ -133,23 +129,53 @@ class BrowserController:
     def get_element_map(self) -> List[dict]:
         return self.driver.execute_script("""() => {
             const elements = [];
+            // Clear stale ids from the previous scan — on SPA-style surveys
+            // the DOM partially persists and [data-bot-id='7'] would match
+            // the first stale node, not the current question's.
+            document.querySelectorAll('[data-bot-id]')
+                .forEach(el => el.removeAttribute('data-bot-id'));
             document.querySelectorAll(
                 'button, input, select, textarea, a, [role="button"], [role="radio"], [role="checkbox"], label, .answer-option, .survey-option'
             ).forEach((el, idx) => {
                 if (el.offsetParent === null) return;
                 const rect = el.getBoundingClientRect();
                 if (rect.width < 5 || rect.height < 5) return;
+                // Derive the semantic type from the associated control so a
+                // <label><input type=radio></label> reads as a radio — same
+                // rule content.js applies (shared element-map schema).
+                const control = el.tagName === 'LABEL'
+                    ? (el.querySelector('input, select, textarea') || el) : el;
+                const role = el.getAttribute('role') || '';
+                const semanticType = control.type ||
+                    (role === 'radio' || role === 'checkbox' ? role : '');
                 el.setAttribute('data-bot-id', idx);
-                const text = (el.innerText || el.getAttribute('aria-label') || 
+                const text = (el.innerText || el.getAttribute('aria-label') ||
                              el.getAttribute('placeholder') || el.value || '').substring(0, 120);
-                elements.push({
+                const entry = {
                     id: idx,
                     tag: el.tagName.toLowerCase(),
-                    type: el.type || '',
+                    type: semanticType,
+                    role: role,
+                    name: control.getAttribute('name') || '',
                     text: text,
                     x: Math.round(rect.left + rect.width / 2),
                     y: Math.round(rect.top + rect.height / 2)
-                });
+                };
+                if (semanticType === 'radio' || semanticType === 'checkbox') {
+                    entry.checked = 'checked' in control
+                        ? !!control.checked
+                        : control.getAttribute('aria-checked') === 'true';
+                } else if (el.tagName === 'SELECT') {
+                    entry.value = el.value || '';
+                    entry.options = [...el.options].map(option => ({
+                        value: option.value,
+                        text: option.text.trim(),
+                        disabled: option.disabled
+                    }));
+                } else if ('value' in control) {
+                    entry.value = String(control.value || '').slice(0, 200);
+                }
+                elements.push(entry);
             });
             return elements;
         }""")
@@ -167,7 +193,11 @@ class BrowserController:
         el.click()
 
     def click_coords(self, x: int, y: int):
-        ActionChains(self.driver).move_by_offset(x, y).click().perform()
+        # Absolute viewport click. move_by_offset() is relative to the
+        # CURRENT pointer position, so bare offset clicks drifted
+        # cumulatively on every fallback click.
+        body = self.driver.find_element(By.TAG_NAME, "body")
+        ActionChains(self.driver).move_to_element_with_offset(body, x, y).click().perform()
 
     def type_into(self, element_id: int, text: str, human_like: bool = True):
         sel = f"[data-bot-id='{element_id}']"
@@ -205,7 +235,7 @@ class BrowserController:
             if "i'm not a robot" in body or "verify you are human" in body:
                 return "text"
         except Exception:
-            pass
+            logger.debug("swallowed exception in core.py", exc_info=True)
         return None
 
     def handle_captcha(self):
@@ -217,12 +247,33 @@ class BrowserController:
         return False
 
     def click_next(self) -> bool:
-        selectors = [
-            "button:contains('Next')", "button:contains('Continue')",
-            "button:contains('Submit')", "input[type='submit']",
-            "[id*='Next' i]", "[class*='next' i]", "[class*='continue' i]",
-        ]
-        for sel in selectors:
+        # Pass 1: JS text match — :contains() is jQuery and raises
+        # InvalidSelectorException in Selenium, so the old first three
+        # selectors never ran.
+        try:
+            clicked = self.driver.execute_script("""
+                const re = /\\b(next|continue|submit|send|finish)\\b/i;
+                const cands = Array.from(document.querySelectorAll(
+                    'button, input[type=submit], input[type=button], [role=button], a[href]'));
+                for (const el of cands) {
+                    if (!el.offsetParent || el.disabled) continue;
+                    const t = (el.innerText || el.value ||
+                               el.getAttribute('aria-label') || '');
+                    if (re.test(t)) {
+                        el.scrollIntoView({block: 'center'});
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            """)
+            if clicked:
+                return True
+        except Exception:
+            logger.debug("JS next-button pass failed", exc_info=True)
+        # Pass 2: the attribute-substring selectors that always worked.
+        for sel in ("[id*='next' i]", "[class*='next' i]", "[class*='continue' i]",
+                    "input[type='submit']"):
             try:
                 els = self.driver.find_elements(By.CSS_SELECTOR, sel)
                 for el in els:
@@ -231,7 +282,7 @@ class BrowserController:
                         el.click()
                         return True
             except Exception:
-                continue
+                logger.debug("CSS next-selector %s failed", sel, exc_info=True)
         return False
 
     def goto(self, url: str):
@@ -264,11 +315,9 @@ class BrowserController:
             try:
                 self.driver.quit()
             except Exception:
-                pass
+                logger.debug("swallowed exception in core.py", exc_info=True)
 
 class AIEngine:
-    from participant_profile import get_persona
-
     COMMON_ANSWERS = {
         "age": "32",
         "gender": "Female",
@@ -294,36 +343,59 @@ class AIEngine:
         self.learned_rules: List[str] = []
 
     def try_heuristic(self, question_text: str, options: List[str], elements: List[dict] = None) -> Optional[List[Action]]:
+        """Deterministic fast path, element-based.
+
+        Every element_id emitted is a real data-bot-id from ``elements``.
+        (The retired version indexed a list of option *texts* — filtered in
+        _run_survey_loop, unfiltered in decide() — so its clicks landed on
+        whatever element happened to sit at that index.)
+        """
+        elements = elements or []
         text_lower = question_text.lower()
-        
+
+        # Industry screener: pick "none of the above" when offered.
+        if (re.search(r"\bwork in\b", text_lower) and
+                any(w in text_lower for w in ["marketing", "advertising", "market research"])) or \
+           any(w in text_lower for w in ["do you work in any of the following",
+                                         "work in the following industries"]):
+            for e in elements:
+                kind = real_input_kind(e)
+                if kind in ("radio", "checkbox", "label") and \
+                        "none" in (e.get("text") or "").lower():
+                    return [Action(action_type="click", element_id=e["id"],
+                                   reasoning="heuristic: industry screener -> none")]
+            return None
+
+        # "Select all that apply" — check every unchecked non-"none" box.
+        if any(w in text_lower for w in ["select all that apply",
+                                         "which of the following",
+                                         "have you purchased"]):
+            actions = []
+            for e in elements:
+                if real_input_kind(e) != "checkbox" or e.get("checked"):
+                    continue
+                opt = (e.get("text") or "").lower()
+                if any(bad in opt for bad in ["none", "don't know",
+                                              "prefer not", "not applicable"]):
+                    continue
+                actions.append(Action(action_type="click", element_id=e["id"],
+                                      reasoning="select-all heuristic"))
+            if actions:
+                actions.append(Action(action_type="next",
+                                      reasoning="proceed after select-all"))
+                return actions
+            return None
+
+        # Keyword-matched text input.
         for keyword, answer in self.COMMON_ANSWERS.items():
             if keyword in text_lower:
-                target_id = 0
-                if elements:
-                    target = next((e for e in elements if e.get("tag") in ("input", "textarea") and e.get("type", "") in ("", "text", "number", "email", "tel")), None)
-                    if target:
-                        target_id = target["id"]
-                return [Action(action_type="type", element_id=target_id, value=answer, reasoning=f"heuristic: {keyword}")]
-        
-        # Multi-select "select all" heuristic
-        if any(w in text_lower for w in ["select all that apply", "which of the following", "have you purchased"]):
-            actions = []
-            for i, opt in enumerate(options):
-                opt_lower = opt.lower()
-                if any(bad in opt_lower for bad in ["none", "don't know", "prefer not", "not applicable"]):
-                    continue
-                actions.append(Action(action_type="click", element_id=i, reasoning="select-all heuristic"))
-            if actions:
-                actions.append(Action(action_type="next", reasoning="proceed after select-all"))
-                return actions
-        
-        # Industry trap
-        if (re.search(r"\bwork in\b", text_lower) and any(w in text_lower for w in ["marketing", "advertising", "market research"])) or \
-           any(w in text_lower for w in ["do you work in any of the following", "work in the following industries"]):
-            for i, opt in enumerate(options):
-                if "none" in opt.lower():
-                    return [Action(action_type="click", element_id=i, reasoning="industry trap")]
-        
+                target = next((e for e in elements
+                               if real_input_kind(e) in
+                               {"text", "email", "tel", "number", "date", "editable"}
+                               and not (e.get("value") or "").strip()), None)
+                if target is not None:
+                    return [Action(action_type="type", element_id=target["id"],
+                                   value=answer, reasoning=f"heuristic: {keyword}")]
         return None
 
     def decide(self, screenshot_b64: str, elements: List[dict], url: str, page_text: str) -> Optional[SurveyDecision]:
@@ -355,10 +427,10 @@ Instructions:
 - Keep memory_note to record what question was just answered for consistency."""
 
         try:
-            resp = self.client.beta.chat.completions.parse(
+            resp = self.client.chat.completions.parse(   # .parse left .beta in openai >= 1.40
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": self.get_persona()},
+                    {"role": "system", "content": get_persona()},
                     {"role": "user", "content": [
                         {"type": "text", "text": prompt_text},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}}
@@ -379,16 +451,21 @@ Instructions:
             logger.warning("provider error %s: %s -> heuristic fallback",
                            e.status_code, str(e)[:200])
         except Exception:
-            pass
+            # Was `pass` — this is exactly where the get_persona
+            # TypeError and the schema concatenation TypeError lived,
+            # undetected, since day one.
+            logger.warning("structured LLM call failed", exc_info=True)
 
         # Fallback: try JSON-mode create()
         try:
             resp = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": self.get_persona()},
+                    {"role": "system", "content": get_persona()},
                     {"role": "user", "content": [
-                         {"type": "text", "text": prompt_text + "\n\nYou MUST respond with valid JSON matching this schema:\n" + SurveyDecision.model_json_schema()},
+                         # model_json_schema() returns a DICT — str + dict
+                         # raised TypeError, silently swallowed below
+                         {"type": "text", "text": prompt_text + "\n\nYou MUST respond with valid JSON matching this schema:\n" + json.dumps(SurveyDecision.model_json_schema())},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}}
                     ]}
                 ],
@@ -409,7 +486,7 @@ Instructions:
             logger.warning("provider error %s: %s -> heuristic fallback",
                            e.status_code, str(e)[:200])
         except Exception:
-            pass
+            logger.warning("raw-fallback LLM call failed", exc_info=True)
 
         # Final fallback: heuristic
         heuristic_actions = self.try_heuristic(page_text, [e.get("text", "") for e in elements], elements)
@@ -446,13 +523,15 @@ Instructions:
             logger.warning("provider error %s: %s -> learn_from_disqualification fallback",
                            e.status_code, str(e)[:200])
         except Exception:
-            pass
+            logger.warning("learn_from_disqualification LLM call failed", exc_info=True)
 
 class SurveyBot:
     def __init__(self, api_key: str, base_url: str, model: str, headless: bool = False, profile_name: str = "default"):
         self.browser = BrowserController(headless=headless, profile_dir=f"profiles/{profile_name}")
         self.ai = AIEngine(api_key, base_url, model)
-        self.cache = AnswerCache(path=f"cache/{profile_name}_answers.json")
+        self.cache = AnswerCache(
+            path=str(Path(__file__).resolve().parent / "cache" / f"{profile_name}_answers.json")
+        )
         self.stuck_fingerprint: Optional[str] = None
         self.stuck_since: float = 0
         self.screenshot_counter = 0
@@ -470,8 +549,12 @@ class SurveyBot:
             from PIL import Image
             png_bytes = self.browser.driver.get_screenshot_as_png()
             img = Image.open(io.BytesIO(png_bytes))
-            return str(imagehash.average_hash(img))
+            # phash @ 16 (256 bits). average_hash @ 8 (64 bits) is coarse
+            # enough that toggling a radio hashes identically — stuck
+            # detection fired on pages that were visibly changing.
+            return str(imagehash.phash(img, hash_size=16))
         except Exception:
+            logger.debug("visual fingerprint failed", exc_info=True)
             return None
 
     def is_stuck(self) -> bool:
@@ -480,18 +563,26 @@ class SurveyBot:
         if visual_hash and visual_hash == self.stuck_fingerprint:
             if self.stuck_since == 0:
                 self.stuck_since = now
-            return (now - self.stuck_since) > 35
+            return (now - self.stuck_since) > STUCK_THRESHOLD_SECONDS
         else:
             self.stuck_fingerprint = visual_hash
             self.stuck_since = 0
             return False
 
     def _handle_stuck(self):
-        print("[!] Page hasn't changed in 40s — taking debug screenshot")
-        self.browser.driver.save_screenshot(f"debug_stuck_{self.screenshot_counter}.png")
+        print(f"[!] Page hasn't changed in {STUCK_THRESHOLD_SECONDS}s — taking debug screenshot")
+        try:
+            self.browser.driver.save_screenshot(f"debug_stuck_{self.screenshot_counter}.png")
+        except Exception:
+            logger.debug("debug screenshot failed", exc_info=True)
         self.screenshot_counter += 1
         if self.browser.click_next():
             print("[+] Emergency Next clicked")
+        # Re-arm. The threshold was already exceeded when we got here, so
+        # without this reset the handler re-fired on EVERY loop iteration —
+        # that is why the repo carried 11 byte-identical debug_stuck_*.png.
+        self.stuck_fingerprint = None
+        self.stuck_since = 0
 
     def _verify_action(self, pre_fingerprint: str) -> bool:
         time.sleep(0.8)
@@ -542,7 +633,7 @@ class SurveyBot:
             except KeyboardInterrupt:
                 raise
             except Exception:
-                pass
+                logger.debug("run_interactive poll iteration failed", exc_info=True)
 
     def _run_survey_loop(self):
         while True:
@@ -643,7 +734,7 @@ class SurveyBot:
                         try:
                             self.browser.click_coords(*act.coordinates)
                         except Exception:
-                            pass
+                            logger.debug("swallowed exception in core.py", exc_info=True)
 
                 if act.action_type != "wait":
                     if not self._verify_action(pre_fp):
@@ -651,7 +742,7 @@ class SurveyBot:
                             try:
                                 self.browser.click_coords(*act.coordinates)
                             except Exception:
-                                pass
+                                logger.debug("swallowed exception in core.py", exc_info=True)
 
             if not any(a.action_type == "next" for a in decision.actions):
                 if decision.question_type in ("single_choice", "multi_choice", "text", "dropdown", "grid"):
@@ -663,12 +754,11 @@ class SurveyBot:
                 self.ai.memory.append(decision.memory_note)
 
             if decision and decision.memory_note and decision.question_type not in ("completion", "unknown"):
-                cache_value = {
+                self.cache.set(page_text[:500], options_texts, {
                     "memory_note": decision.memory_note,
                     "answer_summary": decision.page_summary[:200],
-                    "question_type": decision.question_type
-                }
-                self.cache.set(page_text[:500], options_texts, json.dumps(cache_value))
+                    "question_type": decision.question_type,
+                })
 
     def stop(self):
         self.browser.stop()

@@ -31,6 +31,7 @@ TABLE = [
     ('example.com', '', False),
     ('example.com', 'not a url at all', False),
     ('', 'https://example.com/', False),
+    ('example.com', 'https://app.example.com./x', True),  # trailing-dot FQDN
 ]
 
 _failures = 0

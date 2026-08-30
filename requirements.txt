@@ -1,12 +1,20 @@
-fastapi
-uvicorn
-openai
-pydantic
-Pillow
-python-dotenv
-playwright
-httpx
-imagehash
-customtkinter
-pytesseract
-undetected-chromedriver
+# Sentinel Survey Bot — Python dependencies
+# Pinned ranges: >= verified-working lower bound, capped below the next major
+# so an unpinned `pip install -r` can't silently pull a breaking release.
+#
+# openai: the code uses client.chat.completions.parse (structured outputs),
+# which left the .beta namespace in 1.40 — do not drop below that.
+fastapi>=0.141,<0.142
+uvicorn>=0.52,<0.53
+openai>=3.6,<4
+pydantic>=2.13,<3
+httpx>=0.28,<0.29
+Pillow>=12.3,<13
+python-dotenv>=1.2,<2
+playwright>=1.62,<2
+imagehash>=4.3,<5
+numpy>=2.5,<3
+customtkinter>=6.0,<7
+pytesseract>=0.3.13,<0.4
+undetected-chromedriver>=3.5.5,<4
+selenium>=4.48,<5
