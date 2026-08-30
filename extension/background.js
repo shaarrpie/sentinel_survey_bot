@@ -22,14 +22,13 @@ function saveLogs() {
   if (!logsReady) return;      // never clobber stored history mid-boot
   try { chrome.storage.session.set({ sentinelLogs: logs }); } catch (e) {}
 }
-chrome.storage.session.get('sentinelLogs', ({ sentinelLogs }) => {
-  // Restore only if no LOG beat the read — earlier arrivals are newer than
-  // anything in storage, and must not be overwritten by stale history.
+chrome.storage.session.get('sentinelLogs', (result) => {
+  const sentinelLogs = (result && result.sentinelLogs) || [];
   if (!logs.length && Array.isArray(sentinelLogs)) {
     logs = sentinelLogs.filter(e => e && typeof e.line === 'string').slice(-MAX_LOGS);
   }
   logsReady = true;
-  saveLogs();                  // persist whatever accumulated during boot
+  saveLogs();
 });
 
 function authHeaders() {
@@ -269,7 +268,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         build: runState ? runState.build : null   // R7-A
       });
     };
-    chrome.storage.session.get('runState', ({ runState }) => {
+    chrome.storage.session.get('runState', (result) => {
+      const runState = (result && result.runState) || null;
       if (!runState || !runState.running || runState.tabId == null) {
         report(runState);
         return;
@@ -292,7 +292,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === 'OPEN_HUD') {
-    chrome.storage.session.get('hudWindowId', ({ hudWindowId }) => {
+    chrome.storage.session.get('hudWindowId', (result) => {
+      const hudWindowId = (result && result.hudWindowId) != null ? result.hudWindowId : null;
       if (hudWindowId != null) {
         chrome.windows.get(hudWindowId, (w) => {
           if (chrome.runtime.lastError || !w) createHud();
@@ -407,8 +408,9 @@ chrome.debugger.onDetach.addListener((source) => {
 
 chrome.commands.onCommand.addListener((command) => {
     if (command !== 'stop-sentinel') return;
-    chrome.storage.session.get('runState', ({ runState }) => {
-        if (runState && runState.tabId) {
+  chrome.storage.session.get('runState', (result) => {
+    const runState = (result && result.runState) || null;
+    if (runState && runState.tabId) {
             chrome.tabs.sendMessage(runState.tabId, { action: 'STOP' },
                 () => void chrome.runtime.lastError);
         }
@@ -420,7 +422,8 @@ chrome.commands.onCommand.addListener((command) => {
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   lastPointer.delete(tabId);
-  chrome.storage.session.get('runState', ({ runState }) => {
+  chrome.storage.session.get('runState', (result) => {
+    const runState = (result && result.runState) || null;
     if (runState && runState.tabId === tabId) {
       chrome.storage.session.set({
         runState: { running: false, tabId: null, runId: null }
@@ -431,7 +434,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.windows.onRemoved.addListener((windowId) => {
-  chrome.storage.session.get('hudWindowId', ({ hudWindowId }) => {
+  chrome.storage.session.get('hudWindowId', (result) => {
+    const hudWindowId = (result && result.hudWindowId) != null ? result.hudWindowId : null;
     if (hudWindowId === windowId)
       chrome.storage.session.remove('hudWindowId');
   });

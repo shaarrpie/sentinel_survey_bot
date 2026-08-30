@@ -102,8 +102,10 @@ class MouseController:
     def move(self, x, y, duration=0, origin="viewport", button="none"):
         if not self._attached:
             self._attach()
-        pts = self._bezier(self._mouse_input.x, self._mouse_input.y, x, y)
+        sx, sy = self._mouse_input.x, self._mouse_input.y
+        pts = self._bezier(sx, sy, x, y)
         per = duration / max(len(pts) - 1, 1)
+        logger.info(f"    [🖱️ MOUSE MOVE] ({sx},{sy}) -> ({x},{y}) duration={duration}ms")
         for i, (px, py) in enumerate(pts):
             dt = int(per * random.uniform(0.7, 1.3))
             self.cdp("Input.dispatchMouseEvent", {
@@ -127,6 +129,7 @@ class MouseController:
             jitter_y = random.uniform(-0.25, 0.25) * max(1, height)
             tx = int(x + jitter_x)
             ty = int(y + jitter_y)
+            logger.info(f"    [🖱️ CLICK] at ({tx},{ty}) [jitter from ({x},{y}), element {width}x{height}]")
             self.move(tx, ty, duration=random.randint(80, 180))
             self.cdp("Input.dispatchMouseEvent", {
                 "type": "mousePressed",
@@ -298,8 +301,9 @@ class SentinelSurveyBot:
                     except Exception:
                         pass
                 if count > 0:
-                    logger.info(f"[+] Injected {count} saved cookies for this session.")
+                    logger.info(f"[🍪 COOKIES] Injected {count} saved cookies. Refreshing page...")
                     self.driver.refresh()
+                    logger.info(f"    [🔄 REFRESH] Page reloaded at {self.driver.current_url}")
         except Exception:
             pass
 
@@ -359,6 +363,10 @@ class SentinelSurveyBot:
 
     def human_mouse_move(self, element):
         try:
+            rect = element.rect
+            cx = int(rect['x'] + rect['width']/2)
+            cy = int(rect['y'] + rect['height']/2)
+            logger.info(f"    [🖱️ HUMAN MOVE] to element at ({cx},{cy}) [{rect['width']:.0f}x{rect['height']:.0f}]")
             self.actions.move_to_element(element).perform()
             time.sleep(random.uniform(0.1, 0.4))
         except Exception:
@@ -373,6 +381,7 @@ class SentinelSurveyBot:
         time.sleep(total_delay)
 
     def human_type(self, element, text):
+        logger.info(f"    [⌨️ TYPE] '{text}' into element")
         for char in text:
             element.send_keys(char)
             delay = random.uniform(0.04, 0.12)
@@ -567,6 +576,7 @@ class SentinelSurveyBot:
                     rect = best_input.rect
                     cx = int(rect['x'] + rect['width']/2)
                     cy = int(rect['y'] + rect['height']/2)
+                    logger.info(f"    [📜 SCROLL] Element into view, center at ({cx},{cy})")
                     self.mouse.move(cx, cy, duration=random.randint(60, 140))
                 except Exception:
                     self.human_mouse_move(best_input)
@@ -614,6 +624,7 @@ class SentinelSurveyBot:
                 
                 if opt_text and (label_lower in opt_text or (coord_marker and coord_marker.lower() in label_lower)):
                     self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", opt_el)
+                    logger.info(f"    [📜 SCROLL] Option into view: {opt_el.text.strip()[:40]}")
                     try:
                         rect = opt_el.rect
                         cx = int(rect['x'] + rect['width']/2)
@@ -732,6 +743,7 @@ class SentinelSurveyBot:
                     rect = next_btn.rect
                     cx = int(rect['x'] + rect['width'] / 2)
                     cy = int(rect['y'] + rect['height'] / 2)
+                    logger.info(f"    [➡️ NEXT BUTTON] Clicking 'Next' at ({cx},{cy}) - text: '{next_btn.text or next_btn.get_attribute('value')}'")
                     clicked = self.mouse.click(
                         cx, cy, int(rect['width']), int(rect['height'])
                     )
@@ -748,6 +760,8 @@ class SentinelSurveyBot:
         if target_url:
             logger.info(f"[*] Navigating to {target_url}...")
             self.driver.get(target_url)
+            logger.info(f"    [🌐 NAVIGATED] Now at: {self.driver.current_url}")
+            logger.info(f"    [📄 PAGE TITLE] {self.driver.title}")
             self.load_cookies()
         logger.info("[+] SentinelCore Manual HUD Active. Monitoring screen for questions...")
         logger.info("[+] Hotkey Active: Press 'P' in this console at any time to PAUSE/RESUME the scanner.")
@@ -796,7 +810,7 @@ class SentinelSurveyBot:
                         current_handle = self.driver.current_window_handle
                         if current_handle != handles[-1]:
                             self.driver.switch_to.window(handles[-1])
-                            logger.info("[+] Switched to new popup tab.")
+                            logger.info(f"    [🗔 TAB SWITCH] Switched to new popup tab. Now at: {self.driver.current_url}")
                 except Exception:
                     pass
 
@@ -825,11 +839,19 @@ class SentinelSurveyBot:
                     scored.append((area + host_bonus * 100000, f))
                 scored.sort(key=lambda t: t[0], reverse=True)
                 if scored:
+                    frame_src = scored[0][1].get_attribute("src") or "unknown"
+                    logger.info(f"    [🖼️ FRAME SWITCH] Entering iframe: {frame_src[:80]}")
                     self.driver.switch_to.frame(scored[0][1])
                 else:
                     body = self.driver.find_element(By.TAG_NAME, "body")
+
+                current_url = self.driver.current_url
                 current_text = body.text.strip()
                 current_fingerprint = self.get_page_fingerprint()
+                
+                if current_url != getattr(self, '_last_logged_url', None):
+                    self._last_logged_url = current_url
+                    logger.info(f"    [🌐 URL CHANGE] Now at: {current_url}")
                 
                 # Stuck check: If we have been on the same fingerprint for more than 45 seconds
                 if current_fingerprint == last_fingerprint and last_fingerprint != "" and not self.is_paused:
