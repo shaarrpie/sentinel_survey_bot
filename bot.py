@@ -1116,9 +1116,9 @@ class SentinelSurveyBot:
                     if err_type not in ["StaleElementReferenceException", "NoSuchElementException", "NoSuchWindowException", "WebDriverException"]:
                         logger.debug(f"[-] HUD Loop error: {e}")
                     pass
-                except KeyboardInterrupt:
-                    logger.info("\n[!] Interrupted by user (Ctrl+C)")
-            finally:
+        except KeyboardInterrupt:
+            logger.info("\n[!] Interrupted by user (Ctrl+C)")
+        finally:
             # Graceful shutdown: save cookies and cleanup
             logger.info("[*] Shutting down gracefully...")
             try:
