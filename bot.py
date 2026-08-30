@@ -5,14 +5,23 @@ import io
 import base64
 import json
 import logging
-import msvcrt
 import datetime
 import socket
 import shutil
 import re
+import sys
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 load_dotenv()
+
+# Cross-platform keyboard polling
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import select
+    import termios
+    import tty
+
 # pyrefly: ignore [missing-import]
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
@@ -42,13 +51,16 @@ def clean_model_text(value: str | None) -> str:
 
 
 log_filename = f"logs/survey_run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+# Use rotating file handler: 5MB max per file, keep 3 backups
+from logging.handlers import RotatingFileHandler
+file_handler = RotatingFileHandler(
+    log_filename, maxBytes=5*1024*1024, backupCount=3, encoding='utf-8'
+)
+console_handler = logging.StreamHandler()
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_filename, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
+    handlers=[file_handler, console_handler]
 )
 logger = logging.getLogger(__name__)
 
@@ -91,11 +103,28 @@ class MouseController:
             self._attached = False
 
     def _bezier(self, x0, y0, x1, y1, n=12):
+        """Cubic Bezier with randomized control points for human-like curve."""
+        dx = x1 - x0
+        dy = y1 - y0
+        # Random control points that create a natural curve
+        # Place them perpendicular to the direct path for realistic arc
+        offset = random.uniform(0.2, 0.5)
+        perp_x = -dy * offset * random.choice([-1, 1])
+        perp_y = dx * offset * random.choice([-1, 1])
+        
+        # Control points at 1/3 and 2/3 along path with perpendicular offset
+        cx1 = x0 + dx / 3 + perp_x * random.uniform(0.5, 1.5)
+        cy1 = y0 + dy / 3 + perp_y * random.uniform(0.5, 1.5)
+        cx2 = x0 + 2 * dx / 3 + perp_x * random.uniform(0.5, 1.5)
+        cy2 = y0 + 2 * dy / 3 + perp_y * random.uniform(0.5, 1.5)
+        
         pts = []
         for i in range(n + 1):
             t = i / n
-            x = x0 + (x1 - x0) * t
-            y = y0 + (y1 - y0) * t
+            # Cubic Bezier formula
+            mt = 1 - t
+            x = mt**3 * x0 + 3 * mt**2 * t * cx1 + 3 * mt * t**2 * cx2 + t**3 * x1
+            y = mt**3 * y0 + 3 * mt**2 * t * cy1 + 3 * mt * t**2 * cy2 + t**3 * y1
             pts.append((int(x), int(y)))
         return pts
 
@@ -186,6 +215,22 @@ def is_port_in_use(port):
         return s.connect_ex(('127.0.0.1', port)) == 0
 
 
+def check_keypress():
+    """Cross-platform non-blocking keypress check. Returns key char or None."""
+    if sys.platform == "win32":
+        if msvcrt.kbhit():
+            return msvcrt.getch()
+        return None
+    else:
+        # Unix/macOS: check stdin without blocking
+        try:
+            if select.select([sys.stdin], [], [], 0)[0]:
+                return sys.stdin.read(1)
+        except Exception:
+            pass
+        return None
+
+
 def provider_location(base_url: str) -> tuple[str, int]:
     parsed = urlparse(base_url)
     host = parsed.hostname or "127.0.0.1"
@@ -274,17 +319,17 @@ class SentinelSurveyBot:
                 try:
                     with open(cookie_file, 'r') as f:
                         existing_cookies = json.load(f)
-                except Exception:
-                    pass
-                
+                except Exception as e:
+                    logger.debug(f"[-] Failed to load existing cookies: {e}")
+            
             cookie_dict = {f"{c['name']}_{c.get('domain', '')}": c for c in existing_cookies}
             for c in cookies:
-                cookie_dict[f"{c['name']}_{c.get('domain', '')}"] = c
+                cookie_dict[f"{c['name']}_{c.get('domain', '')}": c]
                 
             with open(cookie_file, 'w') as f:
                 json.dump(list(cookie_dict.values()), f)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[-] Failed to save cookies: {e}")
 
     def load_cookies(self):
         """Injects cookies for the current domain."""
@@ -293,19 +338,36 @@ class SentinelSurveyBot:
             if os.path.exists(cookie_file):
                 with open(cookie_file, 'r') as f:
                     cookies = json.load(f)
+                
+                # Get current page domain for validation
+                current_url = self.driver.current_url
+                current_domain = urlparse(current_url).netloc
+                # Strip port for comparison
+                current_domain = current_domain.split(":")[0]
+                
                 count = 0
+                skipped = 0
                 for cookie in cookies:
                     try:
+                        cookie_domain = cookie.get("domain", "").lstrip(".")
+                        # Validate cookie domain matches current page
+                        if cookie_domain and current_domain and \
+                           not (current_domain == cookie_domain or 
+                                current_domain.endswith("." + cookie_domain)):
+                            skipped += 1
+                            continue
                         self.driver.add_cookie(cookie)
                         count += 1
                     except Exception:
                         pass
                 if count > 0:
-                    logger.info(f"[🍪 COOKIES] Injected {count} saved cookies. Refreshing page...")
+                    logger.info(f"[🍪 COOKIES] Injected {count} saved cookies (skipped {skipped} domain mismatches). Refreshing page...")
                     self.driver.refresh()
                     logger.info(f"    [🔄 REFRESH] Page reloaded at {self.driver.current_url}")
-        except Exception:
-            pass
+                elif skipped > 0:
+                    logger.info(f"[🍪 COOKIES] Skipped {skipped} cookies - domain mismatch with current page ({current_domain})")
+        except Exception as e:
+            logger.debug(f"[-] Cookie load error: {e}")
 
     def get_page_fingerprint(self):
         """Generates a unique signature of the page state based on text and input counts."""
@@ -341,25 +403,36 @@ class SentinelSurveyBot:
         
         recent_memory = "\n".join(self.memory_log[-5:])
         prompt = f"I was taking a survey and got disqualified right after answering these questions.\n\nRecent Q&A:\n{recent_memory}\n\nBased on standard survey traps (e.g., prohibited industry, failing a bot check, contradictory answers, or demographic mismatch), identify which answer likely caused the disqualification. Reply ONLY with a 1-sentence strict rule I should add to my persona to never make this mistake again. Start the rule with 'NEVER' or 'ALWAYS'. Do not explain your reasoning."
-        try:
-            response = self.ai_client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.4,
-                max_tokens=200
-            )
-            rule = clean_model_text(response.choices[0].message.content)
-            
-            if "</think>" in rule:
-                rule = rule.split("</think>")[-1].strip()
-            
-            self.add_learned_rule(rule)
-            logger.info(f"[+] AI updated its own persona matrix. It will not fail this way again: {rule}\n")
-            
-            # Clear memory so we don't double-trigger if we stay on the page
-            self.memory_log = []
-        except Exception as e:
-            logger.error(f"[-] AI failed to learn from disqualification: {e}")
+        
+        # Retry with exponential backoff
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self.ai_client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.4,
+                    max_tokens=200,
+                    timeout=30
+                )
+                rule = clean_model_text(response.choices[0].message.content)
+                
+                if "</think>" in rule:
+                    rule = rule.split("</think>")[-1].strip()
+                
+                self.add_learned_rule(rule)
+                logger.info(f"[+] AI updated its own persona matrix. It will not fail this way again: {rule}\n")
+                
+                # Clear memory so we don't double-trigger if we stay on the page
+                self.memory_log = []
+                return
+            except Exception as e:
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(f"[-] Learn from DQ failed (attempt {attempt+1}/{max_retries}): {e}. Retrying in {wait:.1f}s...")
+                if attempt < max_retries - 1:
+                    time.sleep(wait)
+                else:
+                    logger.error(f"[-] Learn from DQ failed after {max_retries} attempts: {e}")
 
     def human_mouse_move(self, element):
         try:
@@ -497,23 +570,32 @@ class SentinelSurveyBot:
             Click: X:340, Y:512
             """
 
-        try:
-            response = self.ai_client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "system", "content": system_persona}, {"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=4096
-            )
-            
-            raw_answer = clean_model_text(response.choices[0].message.content)
-            
-            if "</think>" in raw_answer:
-                raw_answer = raw_answer.split("</think>")[-1].strip()
-            
-            return raw_answer
-        except Exception as e:
-            logger.error(f"[-] AI Error: {e}")
-            return None
+        # Retry with exponential backoff
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self.ai_client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "system", "content": system_persona}, {"role": "user", "content": prompt}],
+                    temperature=0.3,
+                    max_tokens=4096,
+                    timeout=60
+                )
+                
+                raw_answer = clean_model_text(response.choices[0].message.content)
+                
+                if "</think>" in raw_answer:
+                    raw_answer = raw_answer.split("</think>")[-1].strip()
+                
+                return raw_answer
+            except Exception as e:
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                logger.warning(f"[-] AI call failed (attempt {attempt+1}/{max_retries}): {e}. Retrying in {wait:.1f}s...")
+                if attempt < max_retries - 1:
+                    time.sleep(wait)
+                else:
+                    logger.error(f"[-] AI call failed after {max_retries} attempts: {e}")
+                    return None
 
     def execute_type_action(self, label_keyword, value):
         try:
@@ -660,6 +742,20 @@ class SentinelSurveyBot:
                         cx = int(bracket_match.group(1))
                         cy = int(bracket_match.group(2))
                 
+                # Validate coordinates are within viewport bounds
+                if cx is not None and cy is not None:
+                    try:
+                        viewport = self.driver.execute_script("""
+                            return {w: window.innerWidth, h: window.innerHeight};
+                        """)
+                        vp_w = viewport.get('w', 1280)
+                        vp_h = viewport.get('h', 800)
+                        if cx < 0 or cx > vp_w or cy < 0 or cy > vp_h:
+                            logger.error(f"    [-] LLM coordinates X:{cx}, Y:{cy} out of viewport ({vp_w}x{vp_h}) - rejecting")
+                            cx, cy = None
+                    except Exception:
+                        pass
+                
                 if cx is not None and cy is not None:
                     try:
                         self.mouse.click(cx, cy)
@@ -770,94 +866,97 @@ class SentinelSurveyBot:
         fingerprint_since = time.time()
         screenshot_taken_for_current = False
         
-        while not getattr(self, "gui_shutdown", False):
-            time.sleep(1.5)
-            
-            # --- GUI / Hardware Pause Toggle ---
-            if msvcrt.kbhit():
-                char = msvcrt.getch()
-                if char.lower() == b'p':
-                    self.is_paused = not self.is_paused
-                    if self.is_paused:
-                        logger.info("\n[!] ⏸️ SCAN PAUSED. Press 'P' or use GUI to resume.")
-                    else:
-                        logger.info("[+] ▶️ SCAN RESUMED.\n")
-                        last_fingerprint = ""  # Force immediate rescan
-                        fingerprint_since = time.time()
-                        screenshot_taken_for_current = False
-                        
-            if getattr(self, "is_paused", False):
-                continue
-            
-            try:
-                # 1. Recover browser window handle if closed or lost
-                try:
-                    _ = self.driver.current_window_handle
-                except Exception:
-                    handles = self.driver.window_handles
-                    if handles:
-                        self.driver.switch_to.window(handles[0])
-                        logger.info("[+] Recovered closed browser tab/window connection.")
-                    else:
-                        logger.warning("[!] No active browser windows detected.")
-                        time.sleep(2)
-                        continue
-
-                # 2. Automatically follow new tabs/popups (CPX Research loves opening new tabs)
-                try:
-                    handles = self.driver.window_handles
-                    if len(handles) > 1:
-                        current_handle = self.driver.current_window_handle
-                        if current_handle != handles[-1]:
-                            self.driver.switch_to.window(handles[-1])
-                            logger.info(f"    [🗔 TAB SWITCH] Switched to new popup tab. Now at: {self.driver.current_url}")
-                except Exception:
-                    pass
-
-                current_url = self.driver.current_url.lower()
-                if any(k in current_url for k in ["disqualified", "screenout", "reward=0", "&term="]):
-                    if self.memory_log:
-                        self.learn_from_disqualification()
-                    time.sleep(5)
+        try:
+            while not getattr(self, "gui_shutdown", False):
+                time.sleep(1.5)
+                
+                # --- GUI / Hardware Pause Toggle ---
+                key = check_keypress()
+                if key is not None:
+                    if isinstance(key, bytes):
+                        key = key.decode('utf-8', errors='ignore')
+                    if key.lower() == 'p':
+                        self.is_paused = not self.is_paused
+                        if self.is_paused:
+                            logger.info("\n[!] ⏸️ SCAN PAUSED. Press 'P' or use GUI to resume.")
+                        else:
+                            logger.info("[+] ▶️ SCAN RESUMED.\n")
+                            last_fingerprint = ""  # Force immediate rescan
+                            fingerprint_since = time.time()
+                            screenshot_taken_for_current = False
+                            
+                if getattr(self, "is_paused", False):
                     continue
-
-                self.driver.switch_to.default_content()
                 
-                # Check for Iframes — score by area + same-origin bonus
-                current_url = self.driver.current_url
-                current_host = urlparse(current_url).netloc
-                iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
-                scored = []
-                for f in iframes:
-                    if not f.is_displayed():
+                try:
+                    # 1. Recover browser window handle if closed or lost
+                    try:
+                        _ = self.driver.current_window_handle
+                    except Exception:
+                        handles = self.driver.window_handles
+                        if handles:
+                            self.driver.switch_to.window(handles[0])
+                            logger.info("[+] Recovered closed browser tab/window connection.")
+                        else:
+                            logger.warning("[!] No active browser windows detected.")
+                            time.sleep(2)
+                            continue
+
+                    # 2. Automatically follow new tabs/popups (CPX Research loves opening new tabs)
+                    try:
+                        handles = self.driver.window_handles
+                        if len(handles) > 1:
+                            current_handle = self.driver.current_window_handle
+                            if current_handle != handles[-1]:
+                                self.driver.switch_to.window(handles[-1])
+                                logger.info(f"    [🗔 TAB SWITCH] Switched to new popup tab. Now at: {self.driver.current_url}")
+                    except Exception:
+                        pass
+
+                    current_url = self.driver.current_url.lower()
+                    if any(k in current_url for k in ["disqualified", "screenout", "reward=0", "&term="]):
+                        if self.memory_log:
+                            self.learn_from_disqualification()
+                        time.sleep(5)
                         continue
-                    r = f.rect
-                    area = (r.get("width") or 0) * (r.get("height") or 0)
-                    src = f.get_attribute("src") or ""
-                    src_host = urlparse(src).netloc
-                    host_bonus = 2 if (src and (src.startswith("/") or src_host.endswith(current_host))) else 0
-                    scored.append((area + host_bonus * 100000, f))
-                scored.sort(key=lambda t: t[0], reverse=True)
-                if scored:
-                    frame_src = scored[0][1].get_attribute("src") or "unknown"
-                    logger.info(f"    [🖼️ FRAME SWITCH] Entering iframe: {frame_src[:80]}")
-                    self.driver.switch_to.frame(scored[0][1])
-                else:
-                    body = self.driver.find_element(By.TAG_NAME, "body")
 
-                current_url = self.driver.current_url
-                current_text = body.text.strip()
-                current_fingerprint = self.get_page_fingerprint()
-                
-                if current_url != getattr(self, '_last_logged_url', None):
-                    self._last_logged_url = current_url
-                    logger.info(f"    [🌐 URL CHANGE] Now at: {current_url}")
-                
-                # Stuck check: If we have been on the same fingerprint for more than 45 seconds
-                if current_fingerprint == last_fingerprint and last_fingerprint != "" and not self.is_paused:
-                    elapsed = time.time() - fingerprint_since
-                    if elapsed > 45.0 and not screenshot_taken_for_current:
-                        logger.warning(f"\n[⚠️ STUCK DETECTED] Bot has been on the same question for {int(elapsed)} seconds!")
+                    self.driver.switch_to.default_content()
+                    
+                    # Check for Iframes — score by area + same-origin bonus
+                    current_url = self.driver.current_url
+                    current_host = urlparse(current_url).netloc
+                    iframes = self.driver.find_elements(By.TAG_NAME, "iframe")
+                    scored = []
+                    for f in iframes:
+                        if not f.is_displayed():
+                            continue
+                        r = f.rect
+                        area = (r.get("width") or 0) * (r.get("height") or 0)
+                        src = f.get_attribute("src") or ""
+                        src_host = urlparse(src).netloc
+                        host_bonus = 2 if (src and (src.startswith("/") or src_host.endswith(current_host))) else 0
+                        scored.append((area + host_bonus * 100000, f))
+                    scored.sort(key=lambda t: t[0], reverse=True)
+                    if scored:
+                        frame_src = scored[0][1].get_attribute("src") or "unknown"
+                        logger.info(f"    [🖼️ FRAME SWITCH] Entering iframe: {frame_src[:80]}")
+                        self.driver.switch_to.frame(scored[0][1])
+                    else:
+                        body = self.driver.find_element(By.TAG_NAME, "body")
+
+                    current_url = self.driver.current_url
+                    current_text = body.text.strip()
+                    current_fingerprint = self.get_page_fingerprint()
+                    
+                    if current_url != getattr(self, '_last_logged_url', None):
+                        self._last_logged_url = current_url
+                        logger.info(f"    [🌐 URL CHANGE] Now at: {current_url}")
+                    
+                    # Stuck check: If we have been on the same fingerprint for more than 25 seconds
+                    if current_fingerprint == last_fingerprint and last_fingerprint != "" and not self.is_paused:
+                        elapsed = time.time() - fingerprint_since
+                        if elapsed > 25.0 and not screenshot_taken_for_current:
+                            logger.warning(f"\n[⚠️ STUCK DETECTED] Bot has been on the same question for {int(elapsed)} seconds!")
                         screenshot_taken_for_current = True
                         try:
                             screenshot_name = f"screenshots/stuck_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
@@ -1016,6 +1115,22 @@ class SentinelSurveyBot:
                 err_type = type(e).__name__
                 if err_type not in ["StaleElementReferenceException", "NoSuchElementException", "NoSuchWindowException", "WebDriverException"]:
                     logger.debug(f"[-] HUD Loop error: {e}")
+                pass
+        except KeyboardInterrupt:
+            logger.info("\n[!] Interrupted by user (Ctrl+C)")
+        finally:
+            # Graceful shutdown: save cookies and cleanup
+            logger.info("[*] Shutting down gracefully...")
+            try:
+                self.save_cookies()
+                logger.info("[+] Cookies saved.")
+            except Exception as e:
+                logger.debug(f"[-] Failed to save cookies during shutdown: {e}")
+            try:
+                if self.driver:
+                    self.driver.quit()
+                    logger.info("[+] Browser closed.")
+            except Exception:
                 pass
 
     def run(self, target_url):

@@ -27,8 +27,11 @@ class AnswerCache:
             pass
 
     def _make_key(self, page_text: str, options: List[str]) -> str:
-        raw = page_text + "|" + "|".join(options[:10])
-        return hashlib.md5(raw.encode()).hexdigest()
+        # Use ALL options to prevent key collision on large dropdowns
+        # Hash the page text and options separately for better distribution
+        page_hash = hashlib.sha256(page_text.encode()).hexdigest()[:16]
+        options_hash = hashlib.sha256("|".join(options).encode()).hexdigest()[:16]
+        return f"{page_hash}:{options_hash}"
 
     def get(self, page_text: str, options: List[str]) -> Optional[str]:
         key = self._make_key(page_text, options)
