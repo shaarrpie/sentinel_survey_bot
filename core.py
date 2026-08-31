@@ -3,8 +3,10 @@ import hashlib
 import io
 import json
 import os
+import platform
 import random
 import re
+import sys
 import time
 from pathlib import Path
 from typing import List, Optional, Literal
@@ -36,6 +38,17 @@ logger = logging.getLogger(__name__)
 # the extension enforces. (Was 15s here, 8s in backend.py, 45s in the
 # extension — three budgets, the tightest won.)
 DECIDE_PROVIDER_TIMEOUT = 30.0
+
+# ── debug logging ─────────────────────────────────────────────────────
+from debug_logger import (
+    get_survey_logger,
+    StageTimer,
+    StuckDetector,
+    log_startup_diagnostics,
+    DEBUG_LOGGING,
+)
+debug_log = get_survey_logger("SurveyLoop")
+_stuck_detector = StuckDetector(debug_log)
 
 # ── survey-routing / panel login hubs ──────────────────────────────
 # Domains come from panel_config.json, which the extension popup edits at
@@ -105,10 +118,20 @@ class BrowserController:
             logger.debug("swallowed exception in core.py", exc_info=True)
 
     def screenshot_b64(self, compress: bool = True) -> str:
-        png = self.driver.get_screenshot_as_png()
-        if compress:
-            png = self._compress_screenshot(png)
-        return base64.b64encode(png).decode()
+        try:
+            png = self.driver.get_screenshot_as_png()
+            if png is None:
+                debug_log.warning("get_screenshot_as_png() returned None", extra={"stage": "Capture"})
+                return ""
+            if compress:
+                png = self._compress_screenshot(png)
+                if png is None:
+                    debug_log.warning("_compress_screenshot() returned None", extra={"stage": "Capture"})
+                    return ""
+            return base64.b64encode(png).decode()
+        except Exception as e:
+            debug_log.error(f"screenshot_b64 failed: {e}", extra={"stage": "Capture"}, exc_info=True)
+            return ""
 
     def _compress_screenshot(self, png_bytes: bytes, max_size_kb: int = 500) -> bytes:
         try:
@@ -123,62 +146,68 @@ class BrowserController:
                 if buf.tell() < max_size_kb * 1024:
                     return buf.getvalue()
             return buf.getvalue()
-        except Exception:
+        except Exception as e:
+            debug_log.warning(f"_compress_screenshot failed: {e}, returning original", extra={"stage": "Capture"})
             return png_bytes
 
     def get_element_map(self) -> List[dict]:
-        return self.driver.execute_script("""() => {
-            const elements = [];
-            // Clear stale ids from the previous scan — on SPA-style surveys
-            // the DOM partially persists and [data-bot-id='7'] would match
-            // the first stale node, not the current question's.
-            document.querySelectorAll('[data-bot-id]')
-                .forEach(el => el.removeAttribute('data-bot-id'));
-            document.querySelectorAll(
-                'button, input, select, textarea, a, [role="button"], [role="radio"], [role="checkbox"], label, .answer-option, .survey-option'
-            ).forEach((el, idx) => {
-                if (el.offsetParent === null) return;
-                const rect = el.getBoundingClientRect();
-                if (rect.width < 5 || rect.height < 5) return;
-                // Derive the semantic type from the associated control so a
-                // <label><input type=radio></label> reads as a radio — same
-                // rule content.js applies (shared element-map schema).
-                const control = el.tagName === 'LABEL'
-                    ? (el.querySelector('input, select, textarea') || el) : el;
-                const role = el.getAttribute('role') || '';
-                const semanticType = control.type ||
-                    (role === 'radio' || role === 'checkbox' ? role : '');
-                el.setAttribute('data-bot-id', idx);
-                const text = (el.innerText || el.getAttribute('aria-label') ||
-                             el.getAttribute('placeholder') || el.value || '').substring(0, 120);
-                const entry = {
-                    id: idx,
-                    tag: el.tagName.toLowerCase(),
-                    type: semanticType,
-                    role: role,
-                    name: control.getAttribute('name') || '',
-                    text: text,
-                    x: Math.round(rect.left + rect.width / 2),
-                    y: Math.round(rect.top + rect.height / 2)
-                };
-                if (semanticType === 'radio' || semanticType === 'checkbox') {
-                    entry.checked = 'checked' in control
-                        ? !!control.checked
-                        : control.getAttribute('aria-checked') === 'true';
-                } else if (el.tagName === 'SELECT') {
-                    entry.value = el.value || '';
-                    entry.options = [...el.options].map(option => ({
-                        value: option.value,
-                        text: option.text.trim(),
-                        disabled: option.disabled
-                    }));
-                } else if ('value' in control) {
-                    entry.value = String(control.value || '').slice(0, 200);
-                }
-                elements.push(entry);
-            });
-            return elements;
-        }""")
+        try:
+            result = self.driver.execute_script("""() => {
+                const elements = [];
+                // Clear stale ids from the previous scan — on SPA-style surveys
+                // the DOM partially persists and [data-bot-id='7'] would match
+                // the first stale node, not the current question's.
+                document.querySelectorAll('[data-bot-id]')
+                    .forEach(el => el.removeAttribute('data-bot-id'));
+                document.querySelectorAll(
+                    'button, input, select, textarea, a, [role="button"], [role="radio"], [role="checkbox"], label, .answer-option, .survey-option'
+                ).forEach((el, idx) => {
+                    if (el.offsetParent === null) return;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 5 || rect.height < 5) return;
+                    // Derive the semantic type from the associated control so a
+                    // <label><input type=radio></label> reads as a radio — same
+                    // rule content.js applies (shared element-map schema).
+                    const control = el.tagName === 'LABEL'
+                        ? (el.querySelector('input, select, textarea') || el) : el;
+                    const role = el.getAttribute('role') || '';
+                    const semanticType = control.type ||
+                        (role === 'radio' || role === 'checkbox' ? role : '');
+                    el.setAttribute('data-bot-id', idx);
+                    const text = (el.innerText || el.getAttribute('aria-label') ||
+                                 el.getAttribute('placeholder') || el.value || '').substring(0, 120);
+                    const entry = {
+                        id: idx,
+                        tag: el.tagName.toLowerCase(),
+                        type: semanticType,
+                        role: role,
+                        name: control.getAttribute('name') || '',
+                        text: text,
+                        x: Math.round(rect.left + rect.width / 2),
+                        y: Math.round(rect.top + rect.height / 2)
+                    };
+                    if (semanticType === 'radio' || semanticType === 'checkbox') {
+                        entry.checked = 'checked' in control
+                            ? !!control.checked
+                            : control.getAttribute('aria-checked') === 'true';
+                    } else if (el.tagName === 'SELECT') {
+                        entry.value = el.value || '';
+                        entry.options = [...el.options].map(option => ({
+                            value: option.value,
+                            text: option.text.trim(),
+                            disabled: option.disabled
+                        }));
+                    } else if ('value' in control) {
+                        entry.value = String(control.value || '').slice(0, 200);
+                    }
+                    elements.push(entry);
+                });
+                return elements;
+            }""")
+            return result if result is not None else []
+        except Exception as e:
+            debug_log.warning(f"get_element_map failed: {e}", extra={"stage": "Elements"})
+            return []
 
     def get_page_text(self) -> str:
         return self.driver.find_element(By.TAG_NAME, "body").text
@@ -426,79 +455,105 @@ Instructions:
 - Provide coordinates fallback for critical clicks.
 - Keep memory_note to record what question was just answered for consistency."""
 
+        debug_log.debug(
+            f"DECIDE call: elements={len(elements)} url={url[:80]}",
+            extra={"stage": "AI"},
+        )
+
         try:
-            resp = self.client.chat.completions.parse(   # .parse left .beta in openai >= 1.40
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": get_persona()},
-                    {"role": "user", "content": [
-                        {"type": "text", "text": prompt_text},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}}
-                    ]}
-                ],
-                response_format=SurveyDecision,
-                max_tokens=2500,
-                temperature=0.2,
-            )
-            return resp.choices[0].message.parsed
+            with StageTimer(debug_log, "ai_structured_call", threshold=10.0):
+                resp = self.client.chat.completions.parse(   # .parse left .beta in openai >= 1.40
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": get_persona()},
+                        {"role": "user", "content": [
+                            {"type": "text", "text": prompt_text},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}}
+                        ]}
+                    ],
+                    response_format=SurveyDecision,
+                    max_tokens=2500,
+                    temperature=0.2,
+                )
+            decision = resp.choices[0].message.parsed
+            if decision is not None:
+                debug_log.debug(
+                    f"Structured parse OK: type={decision.question_type} "
+                    f"actions={len(decision.actions)}",
+                    extra={"stage": "AI"},
+                )
+                return decision
+            raise ValueError("Model returned no parseable decision")
 
         except APITimeoutError:
-            logger.warning("provider timed out after %.0fs -> heuristic fallback",
-                           DECIDE_PROVIDER_TIMEOUT)
+            debug_log.warning(
+                f"Provider timed out after {DECIDE_PROVIDER_TIMEOUT}s -> heuristic fallback",
+                extra={"stage": "AI"},
+            )
         except APIConnectionError as e:
-            logger.warning("provider unreachable (%s) -> heuristic fallback", e)
+            debug_log.warning(
+                f"Provider unreachable ({e}) -> heuristic fallback",
+                extra={"stage": "AI"},
+            )
         except APIStatusError as e:
-            logger.warning("provider error %s: %s -> heuristic fallback",
-                           e.status_code, str(e)[:200])
+            debug_log.warning(
+                f"Provider error {e.status_code}: {str(e)[:200]} -> heuristic fallback",
+                extra={"stage": "AI"},
+            )
         except Exception:
-            # Was `pass` — this is exactly where the get_persona
-            # TypeError and the schema concatenation TypeError lived,
-            # undetected, since day one.
-            logger.warning("structured LLM call failed", exc_info=True)
+            debug_log.warning(
+                "Structured LLM call failed", extra={"stage": "AI"}, exc_info=True
+            )
 
         # Fallback: try JSON-mode create()
+        debug_log.debug("Falling back to raw JSON mode", extra={"stage": "AI"})
         try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": get_persona()},
-                    {"role": "user", "content": [
-                         # model_json_schema() returns a DICT — str + dict
-                         # raised TypeError, silently swallowed below
-                         {"type": "text", "text": prompt_text + "\n\nYou MUST respond with valid JSON matching this schema:\n" + json.dumps(SurveyDecision.model_json_schema())},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}}
-                    ]}
-                ],
-                max_tokens=2500,
-                temperature=0.2,
-            )
+            with StageTimer(debug_log, "ai_raw_call", threshold=10.0):
+                resp = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": get_persona()},
+                        {"role": "user", "content": [
+                             # model_json_schema() returns a DICT — str + dict
+                             # raised TypeError, silently swallowed below
+                             {"type": "text", "text": prompt_text + "\n\nYou MUST respond with valid JSON matching this schema:\n" + json.dumps(SurveyDecision.model_json_schema())},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}}
+                        ]}
+                    ],
+                    max_tokens=2500,
+                    temperature=0.2,
+                )
             raw = resp.choices[0].message.content.strip()
             if "```json" in raw:
                 raw = raw.split("```json")[1].split("```")[0]
-            return SurveyDecision.model_validate_json(raw)
+            decision = SurveyDecision.model_validate_json(raw)
+            debug_log.debug(
+                f"Raw JSON parse OK: type={decision.question_type} "
+                f"actions={len(decision.actions)}",
+                extra={"stage": "AI"},
+            )
+            return decision
 
         except APITimeoutError:
-            logger.warning("provider timed out after %.0fs -> heuristic fallback",
-                           DECIDE_PROVIDER_TIMEOUT)
-        except APIConnectionError as e:
-            logger.warning("provider unreachable (%s) -> heuristic fallback", e)
-        except APIStatusError as e:
-            logger.warning("provider error %s: %s -> heuristic fallback",
-                           e.status_code, str(e)[:200])
-        except Exception:
-            logger.warning("raw-fallback LLM call failed", exc_info=True)
-
-        # Final fallback: heuristic
-        heuristic_actions = self.try_heuristic(page_text, [e.get("text", "") for e in elements], elements)
-        if heuristic_actions:
-            print(f"[heuristic] Fallback for: {page_text[:60]}...")
-            return SurveyDecision(
-                page_summary="heuristic",
-                question_type="unknown",
-                confidence=1.0,
-                actions=heuristic_actions,
-                memory_note="heuristic answer"
+            debug_log.warning(
+                f"Raw fallback timed out after {DECIDE_PROVIDER_TIMEOUT}s",
+                extra={"stage": "AI"},
             )
+        except APIConnectionError as e:
+            debug_log.warning(
+                f"Raw fallback unreachable ({e})", extra={"stage": "AI"}
+            )
+        except APIStatusError as e:
+            debug_log.warning(
+                f"Raw fallback error {e.status_code}: {str(e)[:200]}",
+                extra={"stage": "AI"},
+            )
+        except Exception:
+            debug_log.warning(
+                "Raw fallback failed", extra={"stage": "AI"}, exc_info=True
+            )
+
+        debug_log.error("All AI decision paths failed", extra={"stage": "AI"})
         return None
 
     def learn_from_disqualification(self, memory: List[str]):
@@ -558,29 +613,55 @@ class SurveyBot:
             return None
 
     def is_stuck(self) -> bool:
-        visual_hash = self._visual_fingerprint()
+        with StageTimer(debug_log, "visual_fingerprint", threshold=2.0):
+            visual_hash = self._visual_fingerprint()
         now = time.time()
         if visual_hash and visual_hash == self.stuck_fingerprint:
             if self.stuck_since == 0:
                 self.stuck_since = now
-            return (now - self.stuck_since) > STUCK_THRESHOLD_SECONDS
+            elapsed = now - self.stuck_since
+            debug_log.debug(
+                f"Stuck check: SAME fingerprint for {elapsed:.1f}s "
+                f"(threshold={STUCK_THRESHOLD_SECONDS}s)",
+                extra={"stage": "StuckCheck"},
+            )
+            return elapsed > STUCK_THRESHOLD_SECONDS
         else:
+            if visual_hash != self.stuck_fingerprint and self.stuck_since != 0:
+                debug_log.debug(
+                    "Stuck check: fingerprint CHANGED, resetting timer",
+                    extra={"stage": "StuckCheck"},
+                )
             self.stuck_fingerprint = visual_hash
             self.stuck_since = 0
             return False
 
     def _handle_stuck(self):
-        print(f"[!] Page hasn't changed in {STUCK_THRESHOLD_SECONDS}s — taking debug screenshot")
+        debugLog.warning(
+            f"Handling stuck state — taking debug screenshot "
+            f"(counter={self.screenshot_counter})",
+            extra={"stage": "StuckHandler"},
+        )
         try:
-            self.browser.driver.save_screenshot(f"debug_stuck_{self.screenshot_counter}.png")
-        except Exception:
-            logger.debug("debug screenshot failed", exc_info=True)
-        self.screenshot_counter += 1
+            self.browser.driver.save_screenshot(
+                f"debug_stuck_{self.screenshot_counter}.png"
+            )
+        except Exception as e:
+            debugLog.error(
+                f"Debug screenshot failed: {e}",
+                extra={"stage": "StuckHandler"},
+                exc_info=True,
+            )
         if self.browser.click_next():
-            print("[+] Emergency Next clicked")
-        # Re-arm. The threshold was already exceeded when we got here, so
-        # without this reset the handler re-fired on EVERY loop iteration —
-        # that is why the repo carried 11 byte-identical debug_stuck_*.png.
+            debugLog.info(
+                "Emergency Next clicked during stuck recovery",
+                extra={"stage": "StuckHandler"},
+            )
+        else:
+            debugLog.warning(
+                "Could not click Next during stuck recovery",
+                extra={"stage": "StuckHandler"},
+            )
         self.stuck_fingerprint = None
         self.stuck_since = 0
 
@@ -600,17 +681,29 @@ class SurveyBot:
 
     def run_interactive(self):
         self.browser.start()
+        log_startup_diagnostics(debug_log)
+        debug_log.info(
+            "Browser opened. Navigate to survey, press F12 to start.",
+            extra={"stage": "Interactive"},
+        )
         print("[+] Browser opened. Navigate to the survey, then press F12 to start.")
         print("    Press Ctrl+C in this terminal to stop.")
 
         started = False
+        poll_count = 0
         while True:
             time.sleep(0.5)
+            poll_count += 1
             try:
                 driver = self.browser.driver
                 if driver and not started:
                     url = driver.current_url
                     if not url or url == "about:blank":
+                        if poll_count % 20 == 0:
+                            debug_log.debug(
+                                f"Waiting for navigation (poll={poll_count})",
+                                extra={"stage": "Interactive"},
+                            )
                         continue
 
                     driver.execute_script("""
@@ -625,140 +718,372 @@ class SurveyBot:
                     last_key = driver.execute_script("return window.__sentinelStartKey;")
                     if last_key == "F12":
                         started = True
+                        debug_log.info(
+                            f"F12 detected on {url} — starting survey loop",
+                            extra={"stage": "Interactive"},
+                        )
                         print(f"[+] F12 detected on {url} — starting survey loop")
                         self._run_survey_loop()
                         started = False
                         driver.execute_script("window.__sentinelStartKey = null;")
+                        debug_log.info(
+                            "Survey loop ended. Navigate to another page and press F12.",
+                            extra={"stage": "Interactive"},
+                        )
                         print("[+] Survey loop ended. Navigate to another page and press F12 again.")
             except KeyboardInterrupt:
+                debug_log.info("Interrupted by user (Ctrl+C)", extra={"stage": "Interactive"})
                 raise
-            except Exception:
+            except Exception as e:
+                debug_log.error(
+                    f"run_interactive poll failed: {e}",
+                    extra={"stage": "Interactive"},
+                    exc_info=True,
+                )
                 logger.debug("run_interactive poll iteration failed", exc_info=True)
 
     def _run_survey_loop(self):
+        log_startup_diagnostics(debug_log)
+        loop_iteration = 0
+        consecutive_timeouts = 0
+
         while True:
-            time.sleep(1.5)
+            loop_iteration += 1
+            iter_start = time.perf_counter()
+            debug_log.info(
+                f"Iteration={loop_iteration} START",
+                extra={"stage": "Loop"},
+            )
 
-            if self.browser.disqualified or self.browser.is_disqualified():
-                print("[!] DISQUALIFIED")
-                self.ai.learn_from_disqualification(self.ai.memory)
-                break
-
-            if self.browser.is_completion():
-                print("[+] SURVEY COMPLETED")
-                break
-
-            if self.browser.handle_captcha():
-                continue
-
-            if self.is_stuck():
-                self._handle_stuck()
-                continue
-
-            screenshot = self.browser.screenshot_b64()
-            elements = self.browser.get_element_map()
-            page_text = self.browser.get_page_text()
-            current_url = self.browser.get_url()
-
-            options_texts = [e.get("text", "") for e in elements if e.get("text")]
-
-            cached = self.cache.get(page_text[:500], options_texts)
-            if cached:
-                print(f"[cache] Cached answer found: {cached[:120]}")
-                page_text += f"\n\n[CONTEXT: You previously answered this question with: {cached}. Use the same answer.]"
-                decision = self.ai.decide(screenshot, elements, current_url, page_text)
-            else:
-                heuristic_actions = self.ai.try_heuristic(page_text, options_texts, elements)
-                if heuristic_actions:
-                    print(f"[heuristic] Fast path for: {page_text[:60]}...")
-                    decision = SurveyDecision(
-                        page_summary="heuristic",
-                        question_type="unknown",
-                        confidence=1.0,
-                        actions=heuristic_actions,
-                        memory_note="heuristic answer"
+            # --- Disqualification check ---
+            with StageTimer(debug_log, "check_disqualified"):
+                is_dq = self.browser.disqualified or self.browser.is_disqualified()
+                if is_dq:
+                    debug_log.warning(
+                        "DISQUALIFIED detected", extra={"stage": "Loop"}
                     )
-                else:
-                    decision = self.ai.decide(screenshot, elements, current_url, page_text)
+                    self.ai.learn_from_disqualification(self.ai.memory)
+                    break
 
+            # --- Completion check ---
+            with StageTimer(debug_log, "check_completion"):
+                if self.browser.is_completion():
+                    debug_log.info(
+                        "SURVEY COMPLETED", extra={"stage": "Loop"}
+                    )
+                    break
+
+            # --- CAPTCHA check ---
+            with StageTimer(debug_log, "check_captcha"):
+                if self.browser.handle_captcha():
+                    debug_log.info(
+                        "CAPTCHA detected, waiting for manual solve",
+                        extra={"stage": "Loop"},
+                    )
+                    continue
+
+            # --- Stuck check ---
+            with StageTimer(debug_log, "check_stuck", threshold=2.0):
+                if self.is_stuck():
+                    debug_log.warning(
+                        f"STUCK detected (threshold={STUCK_THRESHOLD_SECONDS}s)",
+                        extra={"stage": "Loop"},
+                    )
+                    self._handle_stuck()
+                    continue
+
+            # --- Capture page state ---
+            with StageTimer(debug_log, "capture_state", threshold=3.0):
+                screenshot = self.browser.screenshot_b64()
+                elements = self.browser.get_element_map()
+                page_text = self.browser.get_page_text()
+                current_url = self.browser.get_url()
+                page_title = ""
+                try:
+                    page_title = self.browser.driver.title or ""
+                except Exception:
+                    pass
+
+                # Defensive: handle None returns
+                screenshot_len = len(screenshot) if screenshot else 0
+                elements_len = len(elements) if elements else 0
+                page_text_len = len(page_text) if page_text else 0
+
+                debug_log.debug(
+                    f"State captured | url={current_url[:100] if current_url else 'None'} | "
+                    f"title={page_title[:60]} | "
+                    f"elements={elements_len} | "
+                    f"page_text_len={page_text_len} | "
+                    f"screenshot_b64_len={screenshot_len}",
+                    extra={"stage": "Capture"},
+                )
+
+                if not screenshot:
+                    debug_log.warning(
+                        "Screenshot is empty, skipping iteration",
+                        extra={"stage": "Capture"},
+                    )
+                    continue
+
+            # --- Element analysis ---
+            with StageTimer(debug_log, "analyze_elements"):
+                elements = elements or []
+                options_texts = [
+                    e.get("text", "") for e in elements if e.get("text")
+                ]
+                visible_elements = sum(
+                    1 for e in elements if e.get("text") or e.get("tag")
+                )
+                debug_log.debug(
+                    f"Elements: total={len(elements)} visible={visible_elements} "
+                    f"with_text={len(options_texts)}",
+                    extra={"stage": "Elements"},
+                )
+
+            # --- Question detection ---
+            with StageTimer(debug_log, "detect_question"):
+                page_text = page_text or ""
+                question_preview = page_text[:150].replace("\n", " ")
+                debug_log.debug(
+                    f"Question detected: {question_preview}",
+                    extra={"stage": "Question"},
+                )
+
+            # --- Cache lookup ---
+            with StageTimer(debug_log, "cache_lookup"):
+                cached = self.cache.get(page_text[:500], options_texts)
+                if cached:
+                    debug_log.info(
+                        f"CACHE HIT: {cached[:120]}",
+                        extra={"stage": "Cache"},
+                    )
+                    page_text += (
+                        f"\n\n[CONTEXT: You previously answered this question "
+                        f"with: {cached}. Use the same answer.]"
+                    )
+
+            # --- Decision (heuristic or AI) ---
+            decision = None
+            decision_source = "none"
+            with StageTimer(debug_log, "decide", threshold=5.0):
+                if cached:
+                    decision = self.ai.decide(
+                        screenshot, elements, current_url, page_text
+                    )
+                    decision_source = "ai_cached_context"
+                else:
+                    # Try heuristic first
+                    heuristic_actions = self.ai.try_heuristic(
+                        page_text, options_texts, elements
+                    )
+                    if heuristic_actions:
+                        debug_log.info(
+                            f"HEURISTIC path: {len(heuristic_actions)} actions",
+                            extra={"stage": "Decide"},
+                        )
+                        decision = SurveyDecision(
+                            page_summary="heuristic",
+                            question_type="unknown",
+                            confidence=1.0,
+                            actions=heuristic_actions,
+                            memory_note="heuristic answer",
+                        )
+                        decision_source = "heuristic"
+                    else:
+                        debug_log.debug(
+                            "No heuristic match, calling AI",
+                            extra={"stage": "Decide"},
+                        )
+                        decision = self.ai.decide(
+                            screenshot, elements, current_url, page_text
+                        )
+                        decision_source = "ai"
+
+            # --- Decision result ---
             if not decision:
-                print("[-] AI returned nothing, retrying...")
+                debug_log.warning(
+                    f"DECISION EMPTY (source={decision_source}) — retrying",
+                    extra={"stage": "Decide"},
+                )
+                consecutive_timeouts += 1
+                if consecutive_timeouts > 5:
+                    debug_log.error(
+                        f"Too many consecutive empty decisions "
+                        f"({consecutive_timeouts})",
+                        extra={"stage": "Decide"},
+                    )
                 continue
 
-            print(f"\n[AI] {decision.question_type} | confidence: {decision.confidence}")
-            print(f"     Summary: {decision.page_summary[:120]}")
+            consecutive_timeouts = 0
+            debug_log.info(
+                f"DECISION: type={decision.question_type} "
+                f"confidence={decision.confidence} "
+                f"actions={len(decision.actions)} "
+                f"source={decision_source}",
+                extra={"stage": "Decide"},
+            )
 
             if decision.question_type == "completion":
-                print("[+] Completion detected by AI")
+                debug_log.info(
+                    "Completion detected by AI", extra={"stage": "Loop"}
+                )
                 break
 
+            # --- Execute actions ---
             pre_fp = self._page_fingerprint()
-            for act in decision.actions:
-                print(f"     -> {act.action_type}: {act.reasoning[:80]}")
-                pre_fp = self._page_fingerprint()  # FRESH before each action
-                try:
-                    if act.action_type == "click":
-                        if act.element_id is not None:
-                            self.browser.click_element(act.element_id)
-                        elif act.coordinates:
-                            self.browser.click_coords(*act.coordinates)
-                    elif act.action_type == "type":
-                        if act.element_id is not None and act.value:
-                            self.browser.type_into(act.element_id, act.value)
-                    elif act.action_type == "select_multi":
-                        if act.value:
-                            for part in act.value.split(","):
-                                part = part.strip()
-                                if part.isdigit():
-                                    self.browser.click_element(int(part))
-                                else:
-                                    for el in elements:
-                                        if part.lower() in el["text"].lower():
-                                            self.browser.click_element(el["id"])
-                                            break
-                    elif act.action_type == "scroll":
-                        self.browser.scroll_random()
-                    elif act.action_type == "next":
-                        self.browser.click_next()
-                    elif act.action_type == "wait":
-                        time.sleep(2)
-                    elif act.action_type == "human_help":
-                        print("\n" + "="*50)
-                        print("MANUAL HELP NEEDED")
-                        print(f"URL: {current_url}")
-                        print("="*50)
-                        input("Press ENTER after manually fixing the page...")
-                except Exception as e:
-                    print(f"[-] Action failed: {e}")
-                    if act.coordinates and act.action_type in ("click", "type"):
-                        try:
-                            self.browser.click_coords(*act.coordinates)
-                        except Exception:
-                            logger.debug("swallowed exception in core.py", exc_info=True)
+            action_results = []
+            with StageTimer(debug_log, "execute_actions", threshold=3.0):
+                for act in decision.actions:
+                    debug_log.debug(
+                        f"ACTION: type={act.action_type} "
+                        f"element_id={act.element_id} "
+                        f"value={str(act.value)[:50] if act.value else 'None'} "
+                        f"coords={act.coordinates} "
+                        f"reasoning={act.reasoning[:80]}",
+                        extra={"stage": "Action"},
+                    )
+                    pre_fp = self._page_fingerprint()
+                    action_ok = False
+                    try:
+                        if act.action_type == "click":
+                            if act.element_id is not None:
+                                self.browser.click_element(act.element_id)
+                                action_ok = True
+                            elif act.coordinates:
+                                self.browser.click_coords(*act.coordinates)
+                                action_ok = True
+                        elif act.action_type == "type":
+                            if act.element_id is not None and act.value:
+                                self.browser.type_into(
+                                    act.element_id, act.value
+                                )
+                                action_ok = True
+                        elif act.action_type == "select_multi":
+                            if act.value:
+                                for part in act.value.split(","):
+                                    part = part.strip()
+                                    if part.isdigit():
+                                        self.browser.click_element(int(part))
+                                    else:
+                                        for el in elements:
+                                            if part.lower() in el["text"].lower():
+                                                self.browser.click_element(el["id"])
+                                                break
+                                action_ok = True
+                        elif act.action_type == "scroll":
+                            self.browser.scroll_random()
+                            action_ok = True
+                        elif act.action_type == "next":
+                            self.browser.click_next()
+                            action_ok = True
+                        elif act.action_type == "wait":
+                            time.sleep(2)
+                            action_ok = True
+                        elif act.action_type == "human_help":
+                            debug_log.warning(
+                                "MANUAL HELP NEEDED — waiting for user",
+                                extra={"stage": "Action"},
+                            )
+                            print("\n" + "=" * 50)
+                            print("MANUAL HELP NEEDED")
+                            print(f"URL: {current_url}")
+                            print("=" * 50)
+                            input("Press ENTER after manually fixing the page...")
+                            action_ok = True
 
-                if act.action_type != "wait":
-                    if not self._verify_action(pre_fp):
-                        if act.coordinates and act.action_type == "click":
+                        debug_log.debug(
+                            f"ACTION RESULT: type={act.action_type} ok={action_ok}",
+                            extra={"stage": "Action"},
+                        )
+
+                    except Exception as e:
+                        debug_log.error(
+                            f"ACTION FAILED: type={act.action_type} error={e}",
+                            extra={"stage": "Action"},
+                            exc_info=True,
+                        )
+                        action_ok = False
+                        if act.coordinates and act.action_type in ("click", "type"):
                             try:
                                 self.browser.click_coords(*act.coordinates)
-                            except Exception:
-                                logger.debug("swallowed exception in core.py", exc_info=True)
+                                debug_log.debug(
+                                    "Fallback coordinate click succeeded",
+                                    extra={"stage": "Action"},
+                                )
+                            except Exception as e2:
+                                debug_log.error(
+                                    f"Fallback click also failed: {e2}",
+                                    extra={"stage": "Action"},
+                                    exc_info=True,
+                                )
 
-            if not any(a.action_type == "next" for a in decision.actions):
-                if decision.question_type in ("single_choice", "multi_choice", "text", "dropdown", "grid"):
-                    time.sleep(0.5)
-                    if self.browser.click_next():
-                        print("     [+] Auto-clicked Next")
+                    # Verify action had effect
+                    if act.action_type != "wait":
+                        with StageTimer(debug_log, "verify_action"):
+                            if not self._verify_action(pre_fp):
+                                debug_log.warning(
+                                    f"Action {act.action_type} had no effect",
+                                    extra={"stage": "Verify"},
+                                )
+                                if act.coordinates and act.action_type == "click":
+                                    try:
+                                        self.browser.click_coords(*act.coordinates)
+                                    except Exception as e:
+                                        debug_log.error(
+                                            f"Verify fallback failed: {e}",
+                                            extra={"stage": "Verify"},
+                                            exc_info=True,
+                                        )
 
+                    action_results.append(action_ok)
+
+            # --- Auto-click Next if needed ---
+            with StageTimer(debug_log, "auto_next"):
+                has_next = any(a.action_type == "next" for a in decision.actions)
+                if not has_next:
+                    qtypes = ("single_choice", "multi_choice", "text", "dropdown", "grid")
+                    if decision.question_type in qtypes:
+                        time.sleep(0.5)
+                        if self.browser.click_next():
+                            debug_log.info(
+                                "Auto-clicked Next", extra={"stage": "Nav"}
+                            )
+
+            # --- Memory & cache ---
             if decision.memory_note:
                 self.ai.memory.append(decision.memory_note)
-
             if decision and decision.memory_note and decision.question_type not in ("completion", "unknown"):
                 self.cache.set(page_text[:500], options_texts, {
                     "memory_note": decision.memory_note,
                     "answer_summary": decision.page_summary[:200],
                     "question_type": decision.question_type,
                 })
+
+            # --- Stuck detection ---
+            page_fp = self._page_fingerprint()
+            question_text = page_text[:200]
+            diag = _stuck_detector.update(current_url, page_fp, question_text)
+
+            # --- Iteration summary ---
+            iter_elapsed = time.perf_counter() - iter_start
+            debug_log.info(
+                f"Iteration={loop_iteration} completed in {iter_elapsed:.2f}s | "
+                f"url_changed={diag['url_changed']} | "
+                f"question_changed={diag['question_changed']} | "
+                f"fingerprint_changed={diag['fingerprint_changed']} | "
+                f"actions_executed={len(action_results)} | "
+                f"actions_ok={sum(action_results)} | "
+                f"same_state_count={diag['same_state_count']} | "
+                f"stuck_for={diag['stuck_elapsed_s']}s",
+                extra={"stage": "Summary"},
+            )
+
+            # Slow iteration warning
+            if iter_elapsed > 30:
+                debug_log.warning(
+                    f"SLOW iteration: {iter_elapsed:.1f}s — check timing breakdown above",
+                    extra={"stage": "Summary"},
+                )
 
     def stop(self):
         self.browser.stop()

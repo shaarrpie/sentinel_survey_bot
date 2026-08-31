@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.parse
 import uuid
@@ -106,24 +107,18 @@ async def check_token(request: Request, call_next):
             return JSONResponse(status_code=401, content={"detail": "unauthorized"})
     return await call_next(request)
 
-if EXTENSION_ID:
-    _cors_regex = f"chrome-extension://{re.escape(EXTENSION_ID)}"
-else:
-    # Real MV3 IDs are 32 hex chars; at least reject everything else, and
-    # make the operator pin the real one.
-    logger.warning(
-        "[!] SENTINEL_EXTENSION_ID not set — CORS accepts any well-formed "
-        "chrome-extension origin. Get your ID from chrome://extensions "
-        "and pin it in .env."
+if not EXTENSION_ID:
+    raise SystemExit(
+        "[!] SENTINEL_EXTENSION_ID must be set. "
+        "Get your ID from chrome://extensions and pin it in .env."
     )
-    _cors_regex = r"chrome-extension://[0-9a-f]{32}"
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=_cors_regex,
+    allow_origins=[f"chrome-extension://{EXTENSION_ID}"],
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["POST", "GET"],
+    allow_headers=["X-Sentinel-Token", "Content-Type"],
 )
 
 MODEL = MODEL_NAME
@@ -227,20 +222,23 @@ SESSION_LAST_SEEN: dict = {}
 LEARNED_RULES: List[str] = []
 RULES_FILE = Path(__file__).resolve().with_name("learned_rules.json")
 SESSION_TTL = 7200
+_state_lock = threading.Lock()
 
 def _prune_sessions():
-    now = time.time()
-    stale = [sid for sid, ts in SESSION_LAST_SEEN.items()
-             if now - ts > SESSION_TTL]
-    for sid in stale:
-        MEMORY.pop(sid, None)
-        SESSION_LAST_SEEN.pop(sid, None)
+    with _state_lock:
+        now = time.time()
+        stale = [sid for sid, ts in SESSION_LAST_SEEN.items()
+                 if now - ts > SESSION_TTL]
+        for sid in stale:
+            MEMORY.pop(sid, None)
+            SESSION_LAST_SEEN.pop(sid, None)
 
 def load_rules():
     global LEARNED_RULES
     try:
         if RULES_FILE.exists():
-            LEARNED_RULES = json.loads(RULES_FILE.read_text(encoding="utf-8"))
+            with _state_lock:
+                LEARNED_RULES = json.loads(RULES_FILE.read_text(encoding="utf-8"))
     except Exception:
         logger.warning("[rules] could not load %s", RULES_FILE, exc_info=True)
 
@@ -346,9 +344,10 @@ async def decide(req: DecideRequest):
 
     _prune_sessions()
     session_id = req.session_id
-    SESSION_LAST_SEEN[session_id] = time.time()
-    if session_id not in MEMORY:
-        MEMORY[session_id] = []
+    with _state_lock:
+        SESSION_LAST_SEEN[session_id] = time.time()
+        if session_id not in MEMORY:
+            MEMORY[session_id] = []
 
     if len(req.screenshot_b64) > 4_000_000:
         rec.update(path="error", error="screenshot too large",
@@ -468,10 +467,11 @@ async def decide(req: DecideRequest):
         iframe_hint = ("\nNOTE: Some elements are inside an iframe (they carry a "
                        "frame flag). Answer the main page first, then the iframe's question.")
 
-    memory_block = ("\n".join(MEMORY[session_id][-12:])
-                    if MEMORY[session_id] else "None yet.")
-    rules_block = ("\n".join(f"- {r}" for r in LEARNED_RULES)
-                   if LEARNED_RULES else "None yet.")
+    with _state_lock:
+        memory_block = ("\n".join(MEMORY[session_id][-12:])
+                        if MEMORY[session_id] else "None yet.")
+        rules_block = ("\n".join(f"- {r}" for r in LEARNED_RULES)
+                       if LEARNED_RULES else "None yet.")
 
     prompt = f"""You are a survey completion assistant. Answer EVERY visible unanswered question on this page in a SINGLE response.
 
@@ -491,8 +491,9 @@ Rules: {rules_block}{iframe_hint}
 Return JSON matching the SurveyDecision schema with actions for ALL visible questions."""
 
     rec["prompt"] = prompt
-    rec["rules"] = list(LEARNED_RULES)
-    rec["memory_ctx"] = list(MEMORY[session_id][-12:])
+    with _state_lock:
+        rec["rules"] = list(LEARNED_RULES)
+        rec["memory_ctx"] = list(MEMORY[session_id][-12:])
     rec["model"] = MODEL
     _last_debug.update({"ts": rec["ts"], "url": req.url, "prompt": prompt,
                         "persona": get_persona(), "model": MODEL})
@@ -502,7 +503,8 @@ Return JSON matching the SurveyDecision schema with actions for ALL visible ques
             logger.info(f"[omni] structured -> base_url={client.base_url} model={MODEL}")
             with omni_call(provider="openai-compat", model=MODEL,
                            cycle=rec.get("cycle")):
-                resp = client.chat.completions.parse(
+                resp = await asyncio.to_thread(
+                    client.chat.completions.parse,
                     model=MODEL,
                     messages=[
                             {"role": "system", "content": get_persona()},
@@ -535,7 +537,8 @@ Return JSON matching the SurveyDecision schema with actions for ALL visible ques
                 logger.info(f"[omni] raw fallback -> base_url={client.base_url} model={MODEL}")
                 with omni_call(provider="openai-compat", model=MODEL,
                                cycle=rec.get("cycle")):
-                    resp = client.chat.completions.create(
+                    resp = await asyncio.to_thread(
+                        client.chat.completions.create,
                         model=MODEL,
                         messages=[
                         {"role": "system", "content": get_persona()},
@@ -628,9 +631,10 @@ Return JSON matching the SurveyDecision schema with actions for ALL visible ques
 def _finish(rec, req, session_id, decision, t0, path):
     """Shared tail: memory bookkeeping, trace archive, dry-run guard."""
     if decision.memory_note:
-        MEMORY[session_id].append(decision.memory_note)
-        if len(MEMORY[session_id]) > 50:
-            MEMORY[session_id] = MEMORY[session_id][-50:]
+        with _state_lock:
+            MEMORY[session_id].append(decision.memory_note)
+            if len(MEMORY[session_id]) > 50:
+                MEMORY[session_id] = MEMORY[session_id][-50:]
     latency_ms = int((time.time() - t0) * 1000)
     rec.update(path=path,
                confidence=decision.confidence,
@@ -668,14 +672,16 @@ async def learn_rule(req: LearnRequest):
               "1-sentence rule starting with NEVER or ALWAYS:")
     try:
         with omni_call(provider="openai-compat", model=MODEL):
-            resp = client.chat.completions.create(
+            resp = await asyncio.to_thread(
+                client.chat.completions.create,
                 model=MODEL, messages=[{"role": "user", "content": prompt}],
                 max_tokens=100, temperature=0.3,
             )
         rule = resp.choices[0].message.content.strip()
-        if rule and rule not in LEARNED_RULES:
-            LEARNED_RULES.append(rule)
-            save_rules()
+        with _state_lock:
+            if rule and rule not in LEARNED_RULES:
+                LEARNED_RULES.append(rule)
+                save_rules()
         bus.record("backend", "learn",
                    f"rule stored: {rule[:80]}",
                    {"rule": rule}, level="info")
@@ -840,18 +846,7 @@ async def write_panel_hub(req: PanelHubRequest):
                {"panel_hubs": list(domains)}, level="info")
     return {"panel_hubs": list(domains)}
 
-# ── prompt inspector ─────────────────────────────────────────────
-
-@app.get("/debug/last")
-async def debug_last():
-    # Carries the fully assembled prompt and get_persona() — i.e. the
-    # operator's real profile.json. Behind an explicit opt-in flag now.
-    if not DEBUG_ON:
-        raise HTTPException(status_code=404,
-                            detail="debug disabled — set SENTINEL_DEBUG=1 to enable")
-    if not _last_debug:
-        return {"detail": "no calls yet"}
-    return _last_debug
+# ── (debug endpoint removed — was leaking persona/profile data) ──
 
 if __name__ == "__main__":
     if not API_KEY:
