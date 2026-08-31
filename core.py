@@ -66,6 +66,7 @@ _ai_consecutive_failures = 0
 _ai_first_failure_at = None
 _last_failure_category = None
 
+
 # ── survey-routing / panel login hubs ──────────────────────────────
 # Domains come from panel_config.json, which the extension popup edits at
 # runtime via POST /config/panel-hub. Read LIVE on every call so updates
@@ -85,6 +86,29 @@ class SurveyDecision(BaseModel):
     confidence: float = Field(..., ge=0, le=1)
     actions: List[Action]
     memory_note: Optional[str] = None
+
+
+def _fallback_decision(log, reason: str) -> Optional[SurveyDecision]:
+    """Return a safe 'human_help' decision when the AI provider is unreachable.
+    Prevents the survey loop from crashing — flags the page for human review."""
+    log.warning(
+        "AI FALLBACK | reason=%s — returning human_help decision",
+        reason,
+        extra={"stage": "AI"},
+    )
+    return SurveyDecision(
+        page_summary=f"[FALLBACK] AI provider unreachable ({reason}). "
+                     "Flagging for human review.",
+        question_type="unknown",
+        confidence=0.0,
+        actions=[Action(
+            action_type="human_help",
+            reasoning=f"AI provider unreachable ({reason}). "
+                      "Manual intervention required.",
+        )],
+        memory_note=f"AI fallback triggered: {reason}",
+    )
+
 
 class BrowserController:
     def __init__(self, headless: bool = False, slow_mo: int = 50, profile_dir: str = "profiles/default"):
@@ -540,6 +564,14 @@ Instructions:
             except Exception as e:
                 category = log_request_failure(debug_log, e, attempt, started)
                 _last_failure_category = category
+                # Short-circuit: connection errors won't fix themselves in 2s
+                if category in {"CONNECTION_REFUSED", "DNS_FAILURE", "PROXY_FAILURE"}:
+                    debug_log.error(
+                        "AI SHORT-CIRCUIT | %s — skipping retries, using fallback",
+                        category,
+                        extra={"stage": "AI"},
+                    )
+                    return _fallback_decision(debug_log, "connection_down")
                 if attempt < AI_MAX_RETRIES and _retryable(category):
                     delay = min(2 ** attempt, 8)
                     debug_log.warning(
@@ -586,6 +618,14 @@ Instructions:
             except Exception as e:
                 category = log_request_failure(debug_log, e, attempt, started)
                 _last_failure_category = category
+                # Short-circuit: connection errors won't fix themselves in 2s
+                if category in {"CONNECTION_REFUSED", "DNS_FAILURE", "PROXY_FAILURE"}:
+                    debug_log.error(
+                        "AI SHORT-CIRCUIT | %s — skipping retries, using fallback",
+                        category,
+                        extra={"stage": "AI"},
+                    )
+                    return _fallback_decision(debug_log, "connection_down")
                 if attempt < AI_MAX_RETRIES and _retryable(category):
                     delay = min(2 ** attempt, 8)
                     debug_log.warning(
