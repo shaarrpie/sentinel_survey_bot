@@ -50,6 +50,22 @@ from debug_logger import (
 debug_log = get_survey_logger("SurveyLoop")
 _stuck_detector = StuckDetector(debug_log)
 
+# ── AI diagnostics ───────────────────────────────────────────────────
+from ai_diagnostics import (
+    AI_MAX_RETRIES,
+    AI_REQUEST_TIMEOUT,
+    AI_FAILURE_COOLDOWN,
+    MAX_CONSECUTIVE_AI_FAILURES,
+    log_request_failure,
+    log_network_environment,
+    _retryable,
+)
+
+# Module-level failure ledger for the controlled failure policy
+_ai_consecutive_failures = 0
+_ai_first_failure_at = None
+_last_failure_category = None
+
 # ── survey-routing / panel login hubs ──────────────────────────────
 # Domains come from panel_config.json, which the extension popup edits at
 # runtime via POST /config/panel-hub. Read LIVE on every call so updates
@@ -365,11 +381,37 @@ class AIEngine:
             base_url=base_url,
             api_key=api_key or "not-needed",
             timeout=DECIDE_PROVIDER_TIMEOUT,
-            max_retries=1,
+            max_retries=0,  # WE own retries now (labeled, classified)
         )
         self.model = model
         self.memory: List[str] = []
         self.learned_rules: List[str] = []
+
+        # Log the REAL client config at startup
+        from urllib.parse import urlparse
+        u = urlparse(str(self.client.base_url))
+        debug_log.info(
+            "AI-CLIENT | base_url=%s | max_retries=%s | timeout=%s",
+            self.client.base_url,
+            self.client.max_retries,
+            self.client.timeout,
+        )
+        # Preflight: fail fast if endpoint is unreachable
+        port = u.port or (443 if u.scheme == "https" else 80)
+        try:
+            import socket
+            s = socket.create_connection((u.hostname, port), timeout=3)
+            s.close()
+            debug_log.info("AI-PREFLIGHT | TCP connect %s:%s OK", u.hostname, port)
+        except OSError as e:
+            debug_log.error("=" * 60)
+            debug_log.error("AI ENDPOINT UNREACHABLE AT STARTUP")
+            debug_log.error("=" * 60)
+            debug_log.error("Endpoint: %s://%s:%s", u.scheme, u.hostname, port)
+            debug_log.error("Error: %s", e)
+            debug_log.error("The survey loop will NOT work until this is fixed.")
+            debug_log.error("Fix: start the relay, or point base_url at a real provider.")
+            debug_log.error("=" * 60)
 
     def try_heuristic(self, question_text: str, options: List[str], elements: List[dict] = None) -> Optional[List[Action]]:
         """Deterministic fast path, element-based.
@@ -416,8 +458,9 @@ class AIEngine:
             return None
 
         # Keyword-matched text input.
+        # Use word boundaries to avoid false matches (e.g. "age" in "garage").
         for keyword, answer in self.COMMON_ANSWERS.items():
-            if keyword in text_lower:
+            if re.search(rf"\b{re.escape(keyword)}\b", text_lower):
                 target = next((e for e in elements
                                if real_input_kind(e) in
                                {"text", "email", "tel", "number", "date", "editable"}
@@ -428,6 +471,8 @@ class AIEngine:
         return None
 
     def decide(self, screenshot_b64: str, elements: List[dict], url: str, page_text: str) -> Optional[SurveyDecision]:
+        global _ai_consecutive_failures, _ai_first_failure_at, _last_failure_category
+
         memory_block = "\n".join(self.memory[-12:]) if self.memory else "None yet."
         rules_block = "\n".join(f"- {r}" for r in self.learned_rules) if self.learned_rules else "None yet."
 
@@ -460,100 +505,142 @@ Instructions:
             extra={"stage": "AI"},
         )
 
-        try:
-            with StageTimer(debug_log, "ai_structured_call", threshold=10.0):
-                resp = self.client.chat.completions.parse(   # .parse left .beta in openai >= 1.40
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": get_persona()},
-                        {"role": "user", "content": [
-                            {"type": "text", "text": prompt_text},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}}
-                        ]}
-                    ],
-                    response_format=SurveyDecision,
-                    max_tokens=2500,
-                    temperature=0.2,
-                )
-            decision = resp.choices[0].message.parsed
-            if decision is not None:
+        # --- Structured parse attempt ---
+        started = time.time()
+        for attempt in range(1, AI_MAX_RETRIES + 1):
+            try:
+                with StageTimer(debug_log, "ai_structured_call", threshold=10.0):
+                    resp = self.client.chat.completions.parse(
+                        model=self.model,
+                        messages=[
+                            {"role": "system", "content": get_persona()},
+                            {"role": "user", "content": [
+                                {"type": "text", "text": prompt_text},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}}
+                            ]}
+                        ],
+                        response_format=SurveyDecision,
+                        max_tokens=2500,
+                        temperature=0.2,
+                        timeout=AI_REQUEST_TIMEOUT,
+                    )
+                decision = resp.choices[0].message.parsed
+                if decision is not None:
+                    debug_log.debug(
+                        f"Structured parse OK: type={decision.question_type} "
+                        f"actions={len(decision.actions)}",
+                        extra={"stage": "AI"},
+                    )
+                    # SUCCESS: reset failure ledger
+                    _ai_consecutive_failures = 0
+                    _ai_first_failure_at = None
+                    return decision
+                raise ValueError("Model returned no parseable decision")
+
+            except Exception as e:
+                category = log_request_failure(debug_log, e, attempt, started)
+                _last_failure_category = category
+                if attempt < AI_MAX_RETRIES and _retryable(category):
+                    delay = min(2 ** attempt, 8)
+                    debug_log.warning(
+                        f"AI RETRY | sleeping {delay:.1f}s before attempt {attempt + 1}",
+                        extra={"stage": "AI"},
+                    )
+                    time.sleep(delay)
+                else:
+                    break
+
+        # --- Fallback: raw JSON mode ---
+        debug_log.debug("Falling back to raw JSON mode", extra={"stage": "AI"})
+        started = time.time()
+        for attempt in range(1, AI_MAX_RETRIES + 1):
+            try:
+                with StageTimer(debug_log, "ai_raw_call", threshold=10.0):
+                    resp = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=[
+                            {"role": "system", "content": get_persona()},
+                            {"role": "user", "content": [
+                                {"type": "text", "text": prompt_text + "\n\nYou MUST respond with valid JSON matching this schema:\n" + json.dumps(SurveyDecision.model_json_schema())},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}}
+                            ]}
+                        ],
+                        max_tokens=2500,
+                        temperature=0.2,
+                        timeout=AI_REQUEST_TIMEOUT,
+                    )
+                raw = resp.choices[0].message.content.strip()
+                if "```json" in raw:
+                    raw = raw.split("```json")[1].split("```")[0]
+                decision = SurveyDecision.model_validate_json(raw)
                 debug_log.debug(
-                    f"Structured parse OK: type={decision.question_type} "
+                    f"Raw JSON parse OK: type={decision.question_type} "
                     f"actions={len(decision.actions)}",
                     extra={"stage": "AI"},
                 )
+                # SUCCESS: reset failure ledger
+                _ai_consecutive_failures = 0
+                _ai_first_failure_at = None
                 return decision
-            raise ValueError("Model returned no parseable decision")
 
-        except APITimeoutError:
-            debug_log.warning(
-                f"Provider timed out after {DECIDE_PROVIDER_TIMEOUT}s -> heuristic fallback",
-                extra={"stage": "AI"},
-            )
-        except APIConnectionError as e:
-            debug_log.warning(
-                f"Provider unreachable ({e}) -> heuristic fallback",
-                extra={"stage": "AI"},
-            )
-        except APIStatusError as e:
-            debug_log.warning(
-                f"Provider error {e.status_code}: {str(e)[:200]} -> heuristic fallback",
-                extra={"stage": "AI"},
-            )
-        except Exception:
-            debug_log.warning(
-                "Structured LLM call failed", extra={"stage": "AI"}, exc_info=True
-            )
+            except Exception as e:
+                category = log_request_failure(debug_log, e, attempt, started)
+                _last_failure_category = category
+                if attempt < AI_MAX_RETRIES and _retryable(category):
+                    delay = min(2 ** attempt, 8)
+                    debug_log.warning(
+                        f"AI RETRY | sleeping {delay:.1f}s before attempt {attempt + 1}",
+                        extra={"stage": "AI"},
+                    )
+                    time.sleep(delay)
+                else:
+                    break
 
-        # Fallback: try JSON-mode create()
-        debug_log.debug("Falling back to raw JSON mode", extra={"stage": "AI"})
-        try:
-            with StageTimer(debug_log, "ai_raw_call", threshold=10.0):
-                resp = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": get_persona()},
-                        {"role": "user", "content": [
-                             # model_json_schema() returns a DICT — str + dict
-                             # raised TypeError, silently swallowed below
-                             {"type": "text", "text": prompt_text + "\n\nYou MUST respond with valid JSON matching this schema:\n" + json.dumps(SurveyDecision.model_json_schema())},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}}
-                        ]}
-                    ],
-                    max_tokens=2500,
-                    temperature=0.2,
-                )
-            raw = resp.choices[0].message.content.strip()
-            if "```json" in raw:
-                raw = raw.split("```json")[1].split("```")[0]
-            decision = SurveyDecision.model_validate_json(raw)
-            debug_log.debug(
-                f"Raw JSON parse OK: type={decision.question_type} "
-                f"actions={len(decision.actions)}",
-                extra={"stage": "AI"},
-            )
-            return decision
+        # --- All paths failed: controlled failure policy ---
+        _ai_consecutive_failures += 1
+        _ai_first_failure_at = _ai_first_failure_at or time.time()
 
-        except APITimeoutError:
-            debug_log.warning(
-                f"Raw fallback timed out after {DECIDE_PROVIDER_TIMEOUT}s",
-                extra={"stage": "AI"},
-            )
-        except APIConnectionError as e:
-            debug_log.warning(
-                f"Raw fallback unreachable ({e})", extra={"stage": "AI"}
-            )
-        except APIStatusError as e:
-            debug_log.warning(
-                f"Raw fallback error {e.status_code}: {str(e)[:200]}",
-                extra={"stage": "AI"},
-            )
-        except Exception:
-            debug_log.warning(
-                "Raw fallback failed", extra={"stage": "AI"}, exc_info=True
-            )
+        debug_log.error(
+            f"All AI decision paths failed (failures={_ai_consecutive_failures}/"
+            f"{MAX_CONSECUTIVE_AI_FAILURES}, category={_last_failure_category})",
+            extra={"stage": "AI"},
+        )
 
-        debug_log.error("All AI decision paths failed", extra={"stage": "AI"})
+        if _ai_consecutive_failures >= MAX_CONSECUTIVE_AI_FAILURES:
+            total = time.time() - _ai_first_failure_at
+            debug_log.error("=" * 60, extra={"stage": "AI"})
+            debug_log.error("AI PROVIDER FAILURE", extra={"stage": "AI"})
+            debug_log.error("=" * 60, extra={"stage": "AI"})
+            debug_log.error(
+                f"Consecutive failures: {_ai_consecutive_failures}",
+                extra={"stage": "AI"},
+            )
+            debug_log.error(
+                f"Endpoint: {self.ai.client.base_url if hasattr(self, 'ai') else 'unknown'}",
+                extra={"stage": "AI"},
+            )
+            debug_log.error(
+                f"Last error category: {_last_failure_category}",
+                extra={"stage": "AI"},
+            )
+            debug_log.error(
+                f"Total elapsed: {total:.1f}s", extra={"stage": "AI"}
+            )
+            debug_log.error("=" * 60, extra={"stage": "AI"})
+            print("\n" + "=" * 60)
+            print("AI PROVIDER FAILURE — LOOP STOPPED")
+            print(f"  {_ai_consecutive_failures} consecutive failures")
+            print(f"  Category: {_last_failure_category}")
+            print("  Check that your LLM provider is running.")
+            print("=" * 60)
+            return None
+
+        # Brake: sleep before allowing another iteration
+        debug_log.warning(
+            f"AI cooldown: sleeping {AI_FAILURE_COOLDOWN}s before next iteration",
+            extra={"stage": "AI"},
+        )
+        time.sleep(AI_FAILURE_COOLDOWN)
         return None
 
     def learn_from_disqualification(self, memory: List[str]):
@@ -682,6 +769,7 @@ class SurveyBot:
     def run_interactive(self):
         self.browser.start()
         log_startup_diagnostics(debug_log)
+        log_network_environment(debug_log)  # Probe proxy/DNS/TCP before first AI call
         debug_log.info(
             "Browser opened. Navigate to survey, press F12 to start.",
             extra={"stage": "Interactive"},
@@ -906,12 +994,20 @@ class SurveyBot:
                     extra={"stage": "Decide"},
                 )
                 consecutive_timeouts += 1
-                if consecutive_timeouts > 5:
+                if consecutive_timeouts >= 5:
                     debug_log.error(
-                        f"Too many consecutive empty decisions "
-                        f"({consecutive_timeouts})",
+                        f"PROVIDER DOWN: {consecutive_timeouts} consecutive "
+                        f"empty decisions. Check that your LLM provider is "
+                        f"running at the configured BASE_URL.",
                         extra={"stage": "Decide"},
                     )
+                    print("\n" + "=" * 60)
+                    print("PROVIDER DOWN — LOOP STOPPED")
+                    print(f"  {consecutive_timeouts} consecutive empty decisions")
+                    print("  Check that your LLM provider is running.")
+                    print(f"  BASE_URL: {self.ai.client.base_url}")
+                    print("=" * 60)
+                    break
                 continue
 
             consecutive_timeouts = 0
