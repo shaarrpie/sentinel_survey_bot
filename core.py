@@ -21,6 +21,17 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys
+from selenium.common.exceptions import (
+    InvalidSessionIdException,
+    NoSuchWindowException,
+    WebDriverException,
+)
+from webdriver_guard import (
+    SessionGuard, SessionDeadError, HealthStatus, BotState,
+    is_session_death,
+    WD_MAX_RECOVERY_ATTEMPTS, WD_RECOVERY_BACKOFF,
+    WD_SESSION_FAILURE_THRESHOLD,
+)
 
 # is_stuck() threshold — the log message used to say 40s while the code
 # checked 35s; one constant, one number.
@@ -150,9 +161,24 @@ class BrowserController:
         self.driver.request_interceptor = self._intercept
 
     def _intercept(self, request):
+        """uc's request_interceptor callback. Receives the full CDP
+        ``Network.requestWillBeSent`` event. We only treat a request as a
+        disqualification when it's a top-level DOCUMENT navigation; the
+        old loose substring-on-URL match fired on tracking pixels and ad
+        sync beacons whose URLs routinely contain words like
+        ``terminate`` or ``disqualified`` (e.g. ad-pixels with
+        "disqualifier=0" query params)."""
         try:
-            url = (request.url or "").lower()
-            if any(x in url for x in ["disqualified", "screenout", "terminate", "quota_full"]):
+            event = request if isinstance(request, dict) else {}
+            req_type = (event.get("type") or "").lower()
+            if req_type and req_type != "document":
+                return
+            req = event.get("request") or {}
+            url = (req.get("url") or "").lower()
+            if not url:
+                return
+            if any(x in url for x in ["disqualified", "screenout",
+                                      "quota_full", "terminated"]):
                 self.disqualified = True
         except Exception:
             logger.debug("swallowed exception in core.py", exc_info=True)
@@ -384,7 +410,13 @@ class BrowserController:
             try:
                 self.driver.quit()
             except Exception:
-                logger.debug("swallowed exception in core.py", exc_info=True)
+                logger.debug("driver.quit() failed; falling back to service.stop()",
+                             exc_info=True)
+                try:
+                    self.driver.service.stop()
+                except Exception:
+                    logger.debug("service.stop() also failed", exc_info=True)
+            self.driver = None  # no stale handle for poll loops to grab
 
 class AIEngine:
     COMMON_ANSWERS = {
@@ -719,6 +751,7 @@ class SurveyBot:
         self.screenshot_counter = 0
         self.last_action_fingerprint: Optional[str] = None
         self.profile_name = profile_name
+        self.guard = SessionGuard(debug_log)
 
     def _page_fingerprint(self) -> str:
         text = self.browser.get_page_text()[:3000]
@@ -764,7 +797,7 @@ class SurveyBot:
             return False
 
     def _handle_stuck(self):
-        debugLog.warning(
+        debug_log.warning(
             f"Handling stuck state — taking debug screenshot "
             f"(counter={self.screenshot_counter})",
             extra={"stage": "StuckHandler"},
@@ -774,18 +807,18 @@ class SurveyBot:
                 f"debug_stuck_{self.screenshot_counter}.png"
             )
         except Exception as e:
-            debugLog.error(
+            debug_log.error(
                 f"Debug screenshot failed: {e}",
                 extra={"stage": "StuckHandler"},
                 exc_info=True,
             )
         if self.browser.click_next():
-            debugLog.info(
+            debug_log.info(
                 "Emergency Next clicked during stuck recovery",
                 extra={"stage": "StuckHandler"},
             )
         else:
-            debugLog.warning(
+            debug_log.warning(
                 "Could not click Next during stuck recovery",
                 extra={"stage": "StuckHandler"},
             )
@@ -808,8 +841,11 @@ class SurveyBot:
 
     def run_interactive(self):
         self.browser.start()
+        self.guard.attach(self.browser.driver)
+        self.guard.set_state(BotState.BROWSER_READY)
         log_startup_diagnostics(debug_log)
         log_network_environment(debug_log)  # Probe proxy/DNS/TCP before first AI call
+        self.guard.set_state(BotState.WAITING_FOR_F12)
         debug_log.info(
             "Browser opened. Navigate to survey, press F12 to start.",
             extra={"stage": "Interactive"},
@@ -818,408 +854,563 @@ class SurveyBot:
         print("    Press Ctrl+C in this terminal to stop.")
 
         started = False
-        poll_count = 0
+
         while True:
             time.sleep(0.5)
-            poll_count += 1
+            self.guard.poll_count += 1
             try:
                 driver = self.browser.driver
-                if driver and not started:
-                    url = driver.current_url
+                if not driver:
+                    debug_log.debug("driver is None in poll loop", extra={"stage": "Interactive"})
+                    continue
+                if not started:
+                    url = self.guard.trace(
+                        "get_current_url", lambda: driver.current_url)
+                    self.guard.last_known_url = url
+                    self.guard.maybe_heartbeat(self.guard.poll_count)
                     if not url or url == "about:blank":
-                        if poll_count % 20 == 0:
+                        if self.guard.poll_count % 20 == 0:
                             debug_log.debug(
-                                f"Waiting for navigation (poll={poll_count})",
+                                f"Waiting for navigation (poll={self.guard.poll_count})",
                                 extra={"stage": "Interactive"},
                             )
                         continue
 
-                    driver.execute_script("""
-                        if (!window.__sentinelKeyListenerInstalled) {
-                            window.__sentinelKeyListenerInstalled = true;
-                            window.__sentinelStartKey = null;
-                            document.addEventListener('keydown', function(e) {
-                                window.__sentinelStartKey = e.key;
-                            }, true);
-                        }
-                    """)
-                    last_key = driver.execute_script("return window.__sentinelStartKey;")
+                    self.guard.trace("install_key_listener", lambda: driver.execute_script(
+                        "if (!window.__sentinelKeyListenerInstalled) {"
+                        "window.__sentinelKeyListenerInstalled = true;"
+                        "window.__sentinelStartKey = null;"
+                        "document.addEventListener('keydown', function(e) {"
+                        "window.__sentinelStartKey = e.key;}, true);}"))
+                    last_key = self.guard.trace(
+                        "read_start_key",
+                        lambda: driver.execute_script("return window.__sentinelStartKey;"))
+                    self.guard.reset_poll_failures()
                     if last_key == "F12":
                         started = True
+                        self.guard.set_state(BotState.SURVEY_STARTED)
                         debug_log.info(
                             f"F12 detected on {url} — starting survey loop",
                             extra={"stage": "Interactive"},
                         )
                         print(f"[+] F12 detected on {url} — starting survey loop")
-                        self._run_survey_loop()
-                        started = False
-                        driver.execute_script("window.__sentinelStartKey = null;")
-                        debug_log.info(
-                            "Survey loop ended. Navigate to another page and press F12.",
-                            extra={"stage": "Interactive"},
-                        )
-                        print("[+] Survey loop ended. Navigate to another page and press F12 again.")
+                        try:
+                            self._run_survey_loop()
+                        finally:
+                            started = False
+                        if self.guard.state != BotState.STOPPED:
+                            self.guard.set_state(BotState.WAITING_FOR_F12)
+                            debug_log.info(
+                                "Survey loop ended. Navigate to another page and press F12.",
+                                extra={"stage": "Interactive"},
+                            )
+                            print("[+] Survey loop ended. Navigate to another page and press F12 again.")
+
             except KeyboardInterrupt:
+                self.guard.set_state(BotState.STOPPED)
                 debug_log.info("Interrupted by user (Ctrl+C)", extra={"stage": "Interactive"})
                 raise
+
+            except SessionDeadError as sde:
+                if not self._handle_session_death(sde):
+                    break
+                started = False
+
+            except (InvalidSessionIdException, NoSuchWindowException) as e:
+                if not self._handle_session_death(
+                        SessionDeadError(HealthStatus.SESSION_INVALID, str(e))):
+                    break
+                started = False
+
+            except WebDriverException as e:
+                if is_session_death(e):
+                    if not self._handle_session_death(
+                            SessionDeadError(HealthStatus.SESSION_INVALID, str(e))):
+                        break
+                    started = False
+                else:
+                    self._note_transient_poll_error(e)
+
+            except Exception as e:
+                # NOT a session death — count, one-line log, exponential backoff.
+                self._note_transient_poll_error(e)
+
+    def _note_transient_poll_error(self, e: Exception) -> None:
+        """Non-fatal poll error: count + compact log + backoff. Never dump
+        a full traceback at 2 Hz; escalate to session-loss only after
+        WD_SESSION_FAILURE_THRESHOLD consecutive failures."""
+        if self.guard.note_poll_failure():
+            debug_log.error(
+                "POLL FAILURES reached threshold=%d (last: %s: %s) — treating as session loss",
+                WD_SESSION_FAILURE_THRESHOLD, type(e).__name__, str(e)[:200],
+                extra={"stage": "Interactive"},
+            )
+            if not self._handle_session_death(
+                    SessionDeadError(HealthStatus.UNKNOWN, str(e))):
+                self.guard.set_state(BotState.STOPPED)
+                return
+        else:
+            debug_log.warning(
+                "run_interactive poll failed (%d/%d): %s: %s",
+                self.guard.consecutive_poll_failures,
+                WD_SESSION_FAILURE_THRESHOLD,
+                type(e).__name__, str(e)[:200],
+                extra={"stage": "Interactive"},
+            )
+            time.sleep(min(2 ** self.guard.consecutive_poll_failures, 15))
+
+    def _handle_session_death(self, sde: SessionDeadError) -> bool:
+        """One banner + one crash report + bounded recovery. Returns True
+        if polling should resume on a NEW session, False to stop cleanly."""
+        self.guard.set_state(BotState.WEBDRIVER_FAILURE)
+        snap = self.guard.diagnose(sde)
+        self.guard.log_failure_banner(snap)
+        report = self.guard.write_crash_report(snap, sde)
+        if report:
+            debug_log.error("Crash report: %s", report, extra={"stage": "WDGuard"})
+
+        while self.guard.recovery_attempts < WD_MAX_RECOVERY_ATTEMPTS:
+            self.guard.recovery_attempts += 1
+            self.guard.set_state(BotState.RECOVERY)
+            debug_log.warning(
+                "RECOVERY %d/%d — relaunching browser (backoff %.0fs)",
+                self.guard.recovery_attempts, WD_MAX_RECOVERY_ATTEMPTS,
+                WD_RECOVERY_BACKOFF, extra={"stage": "WDGuard"},
+            )
+            try:
+                self.browser.stop()  # best-effort cleanup (HUNK 3)
+            except Exception:
+                logger.debug("browser.stop() during recovery raised", exc_info=True)
+            time.sleep(WD_RECOVERY_BACKOFF)
+            try:
+                self.browser.start()
+                self.guard.attach(self.browser.driver)
+                if self.guard.health(force=True) == HealthStatus.SESSION_HEALTHY:
+                    self.guard.set_state(BotState.WAITING_FOR_F12)
+                    debug_log.info(
+                        "RECOVERY OK — new session healthy. Navigate + press F12.",
+                        extra={"stage": "WDGuard"},
+                    )
+                    print("[+] Browser relaunched after session failure. Press F12 when ready.")
+                    self.guard.consecutive_poll_failures = 0
+                    return True
             except Exception as e:
                 debug_log.error(
-                    f"run_interactive poll failed: {e}",
-                    extra={"stage": "Interactive"},
-                    exc_info=True,
+                    "Recovery relaunch failed: %s: %s",
+                    type(e).__name__, str(e)[:200],
+                    extra={"stage": "WDGuard"}, exc_info=True,
                 )
-                logger.debug("run_interactive poll iteration failed", exc_info=True)
+
+        debug_log.error(
+            "WEBDRIVER SESSION FAILURE — recovery exhausted (%d attempts). Stopping cleanly.",
+            WD_MAX_RECOVERY_ATTEMPTS, extra={"stage": "WDGuard"},
+        )
+        self.guard.set_state(BotState.STOPPED)
+        return False
 
     def _run_survey_loop(self):
+        """Loop driver. The body lives in ``_survey_loop_iteration`` so
+        every WebDriver command is wrapped by a single typed exception
+        boundary that converts session-death into ``SessionDeadError``,
+        letting ``run_interactive`` engage bounded recovery instead of
+        the legacy blanket-except spam loop."""
         log_startup_diagnostics(debug_log)
         loop_iteration = 0
         consecutive_timeouts = 0
 
         while True:
             loop_iteration += 1
+            self.guard.iteration = loop_iteration
             iter_start = time.perf_counter()
+            self.guard.set_state(BotState.QUESTION_DETECTION)
             debug_log.info(
                 f"Iteration={loop_iteration} START",
                 extra={"stage": "Loop"},
             )
 
-            # --- Disqualification check ---
-            with StageTimer(debug_log, "check_disqualified"):
-                is_dq = self.browser.disqualified or self.browser.is_disqualified()
-                if is_dq:
-                    debug_log.warning(
-                        "DISQUALIFIED detected", extra={"stage": "Loop"}
-                    )
-                    self.ai.learn_from_disqualification(self.ai.memory)
-                    break
+            try:
+                # The body manages its own ``break``/``continue`` and returns
+                # only when the loop is truly done. ``consecutive_timeouts``
+                # is read+written via a list-as-cell for mutation across calls.
+                keep_going = self._survey_loop_iteration(
+                    loop_iteration, iter_start,
+                    [consecutive_timeouts],  # mutable cell
+                )
+                consecutive_timeouts = keep_going
+                if not keep_going and keep_going is not None:
+                    return
+                if keep_going is None:
+                    return
+            except SessionDeadError:
+                raise
+            except (InvalidSessionIdException, NoSuchWindowException) as e:
+                raise SessionDeadError(
+                    HealthStatus.SESSION_INVALID,
+                    f"iteration {loop_iteration}: {e}") from e
+            except WebDriverException as e:
+                if is_session_death(e):
+                    raise SessionDeadError(
+                        HealthStatus.SESSION_INVALID,
+                        f"iteration {loop_iteration}: {e}") from e
+                raise
 
-            # --- Completion check ---
-            with StageTimer(debug_log, "check_completion"):
-                if self.browser.is_completion():
-                    debug_log.info(
-                        "SURVEY COMPLETED", extra={"stage": "Loop"}
-                    )
-                    break
+    def _survey_loop_iteration(
+        self,
+        loop_iteration: int,
+        iter_start: float,
+        consecutive_timeouts_cell: list,
+    ):
+        """One iteration of the survey loop. Returns:
+          - ``True``  → continue the loop (timeout counter unchanged)
+          - ``False`` → continue the loop, but reset the timeout counter
+          - ``None``  → break out of the loop (survey done, completion, DQ, or provider down)
+        """
+        consecutive_timeouts = consecutive_timeouts_cell[0]
 
-            # --- CAPTCHA check ---
-            with StageTimer(debug_log, "check_captcha"):
-                if self.browser.handle_captcha():
-                    debug_log.info(
-                        "CAPTCHA detected, waiting for manual solve",
-                        extra={"stage": "Loop"},
-                    )
-                    continue
+        # --- Disqualification check ---
+        with StageTimer(debug_log, "check_disqualified"):
+            is_dq = self.browser.disqualified or self.browser.is_disqualified()
+            if is_dq:
+                debug_log.warning(
+                    "DISQUALIFIED detected", extra={"stage": "Loop"}
+                )
+                self.ai.learn_from_disqualification(self.ai.memory)
+                return None
 
-            # --- Stuck check ---
-            with StageTimer(debug_log, "check_stuck", threshold=2.0):
-                if self.is_stuck():
-                    debug_log.warning(
-                        f"STUCK detected (threshold={STUCK_THRESHOLD_SECONDS}s)",
-                        extra={"stage": "Loop"},
-                    )
-                    self._handle_stuck()
-                    continue
+        # --- Completion check ---
+        with StageTimer(debug_log, "check_completion"):
+            if self.browser.is_completion():
+                debug_log.info(
+                    "SURVEY COMPLETED", extra={"stage": "Loop"}
+                )
+                return None
 
-            # --- Capture page state ---
-            with StageTimer(debug_log, "capture_state", threshold=3.0):
-                screenshot = self.browser.screenshot_b64()
-                elements = self.browser.get_element_map()
-                page_text = self.browser.get_page_text()
-                current_url = self.browser.get_url()
-                page_title = ""
-                try:
-                    page_title = self.browser.driver.title or ""
-                except Exception:
-                    pass
+        # --- CAPTCHA check ---
+        with StageTimer(debug_log, "check_captcha"):
+            if self.browser.handle_captcha():
+                debug_log.info(
+                    "CAPTCHA detected, waiting for manual solve",
+                    extra={"stage": "Loop"},
+                )
+                return True
 
-                # Defensive: handle None returns
-                screenshot_len = len(screenshot) if screenshot else 0
-                elements_len = len(elements) if elements else 0
-                page_text_len = len(page_text) if page_text else 0
+        # --- Stuck check ---
+        with StageTimer(debug_log, "check_stuck", threshold=2.0):
+            if self.is_stuck():
+                debug_log.warning(
+                    f"STUCK detected (threshold={STUCK_THRESHOLD_SECONDS}s)",
+                    extra={"stage": "Loop"},
+                )
+                self._handle_stuck()
+                return True
 
-                debug_log.debug(
-                    f"State captured | url={current_url[:100] if current_url else 'None'} | "
-                    f"title={page_title[:60]} | "
-                    f"elements={elements_len} | "
-                    f"page_text_len={page_text_len} | "
-                    f"screenshot_b64_len={screenshot_len}",
+        # --- Capture page state ---
+        with StageTimer(debug_log, "capture_state", threshold=3.0):
+            screenshot = self.browser.screenshot_b64()
+            elements = self.browser.get_element_map()
+            page_text = self.browser.get_page_text()
+            current_url = self.browser.get_url()
+            page_title = ""
+            try:
+                page_title = self.browser.driver.title or ""
+            except Exception:
+                pass
+
+            # Defensive: handle None returns
+            screenshot_len = len(screenshot) if screenshot else 0
+            elements_len = len(elements) if elements else 0
+            page_text_len = len(page_text) if page_text else 0
+
+            debug_log.debug(
+                f"State captured | url={current_url[:100] if current_url else 'None'} | "
+                f"title={page_title[:60]} | "
+                f"elements={elements_len} | "
+                f"page_text_len={page_text_len} | "
+                f"screenshot_b64_len={screenshot_len}",
+                extra={"stage": "Capture"},
+            )
+
+            if not screenshot:
+                debug_log.warning(
+                    "Screenshot is empty, skipping iteration",
                     extra={"stage": "Capture"},
                 )
+                return True
 
-                if not screenshot:
-                    debug_log.warning(
-                        "Screenshot is empty, skipping iteration",
-                        extra={"stage": "Capture"},
-                    )
-                    continue
+        # --- Element analysis ---
+        with StageTimer(debug_log, "analyze_elements"):
+            elements = elements or []
+            options_texts = [
+                e.get("text", "") for e in elements if e.get("text")
+            ]
+            visible_elements = sum(
+                1 for e in elements if e.get("text") or e.get("tag")
+            )
+            debug_log.debug(
+                f"Elements: total={len(elements)} visible={visible_elements} "
+                f"with_text={len(options_texts)}",
+                extra={"stage": "Elements"},
+            )
 
-            # --- Element analysis ---
-            with StageTimer(debug_log, "analyze_elements"):
-                elements = elements or []
-                options_texts = [
-                    e.get("text", "") for e in elements if e.get("text")
-                ]
-                visible_elements = sum(
-                    1 for e in elements if e.get("text") or e.get("tag")
+        # --- Question detection ---
+        with StageTimer(debug_log, "detect_question"):
+            page_text = page_text or ""
+            question_preview = page_text[:150].replace("\n", " ")
+            debug_log.debug(
+                f"Question detected: {question_preview}",
+                extra={"stage": "Question"},
+            )
+
+        # --- Cache lookup ---
+        with StageTimer(debug_log, "cache_lookup"):
+            cached = self.cache.get(page_text[:500], options_texts)
+            if cached:
+                debug_log.info(
+                    f"CACHE HIT: {cached[:120]}",
+                    extra={"stage": "Cache"},
                 )
-                debug_log.debug(
-                    f"Elements: total={len(elements)} visible={visible_elements} "
-                    f"with_text={len(options_texts)}",
-                    extra={"stage": "Elements"},
+                page_text += (
+                    f"\n\n[CONTEXT: You previously answered this question "
+                    f"with: {cached}. Use the same answer.]"
                 )
 
-            # --- Question detection ---
-            with StageTimer(debug_log, "detect_question"):
-                page_text = page_text or ""
-                question_preview = page_text[:150].replace("\n", " ")
-                debug_log.debug(
-                    f"Question detected: {question_preview}",
-                    extra={"stage": "Question"},
+        # --- Decision (heuristic or AI) ---
+        self.guard.set_state(BotState.AI_DECISION)
+        decision = None
+        decision_source = "none"
+        with StageTimer(debug_log, "decide", threshold=5.0):
+            if cached:
+                decision = self.ai.decide(
+                    screenshot, elements, current_url, page_text
                 )
-
-            # --- Cache lookup ---
-            with StageTimer(debug_log, "cache_lookup"):
-                cached = self.cache.get(page_text[:500], options_texts)
-                if cached:
+                decision_source = "ai_cached_context"
+            else:
+                # Try heuristic first
+                heuristic_actions = self.ai.try_heuristic(
+                    page_text, options_texts, elements
+                )
+                if heuristic_actions:
                     debug_log.info(
-                        f"CACHE HIT: {cached[:120]}",
-                        extra={"stage": "Cache"},
+                        f"HEURISTIC path: {len(heuristic_actions)} actions",
+                        extra={"stage": "Decide"},
                     )
-                    page_text += (
-                        f"\n\n[CONTEXT: You previously answered this question "
-                        f"with: {cached}. Use the same answer.]"
+                    decision = SurveyDecision(
+                        page_summary="heuristic",
+                        question_type="unknown",
+                        confidence=1.0,
+                        actions=heuristic_actions,
+                        memory_note="heuristic answer",
                     )
-
-            # --- Decision (heuristic or AI) ---
-            decision = None
-            decision_source = "none"
-            with StageTimer(debug_log, "decide", threshold=5.0):
-                if cached:
+                    decision_source = "heuristic"
+                else:
+                    debug_log.debug(
+                        "No heuristic match, calling AI",
+                        extra={"stage": "Decide"},
+                    )
                     decision = self.ai.decide(
                         screenshot, elements, current_url, page_text
                     )
-                    decision_source = "ai_cached_context"
-                else:
-                    # Try heuristic first
-                    heuristic_actions = self.ai.try_heuristic(
-                        page_text, options_texts, elements
-                    )
-                    if heuristic_actions:
-                        debug_log.info(
-                            f"HEURISTIC path: {len(heuristic_actions)} actions",
-                            extra={"stage": "Decide"},
-                        )
-                        decision = SurveyDecision(
-                            page_summary="heuristic",
-                            question_type="unknown",
-                            confidence=1.0,
-                            actions=heuristic_actions,
-                            memory_note="heuristic answer",
-                        )
-                        decision_source = "heuristic"
-                    else:
-                        debug_log.debug(
-                            "No heuristic match, calling AI",
-                            extra={"stage": "Decide"},
-                        )
-                        decision = self.ai.decide(
-                            screenshot, elements, current_url, page_text
-                        )
-                        decision_source = "ai"
+                    decision_source = "ai"
 
-            # --- Decision result ---
-            if not decision:
-                debug_log.warning(
-                    f"DECISION EMPTY (source={decision_source}) — retrying",
-                    extra={"stage": "Decide"},
-                )
-                consecutive_timeouts += 1
-                if consecutive_timeouts >= 5:
-                    debug_log.error(
-                        f"PROVIDER DOWN: {consecutive_timeouts} consecutive "
-                        f"empty decisions. Check that your LLM provider is "
-                        f"running at the configured BASE_URL.",
-                        extra={"stage": "Decide"},
-                    )
-                    print("\n" + "=" * 60)
-                    print("PROVIDER DOWN — LOOP STOPPED")
-                    print(f"  {consecutive_timeouts} consecutive empty decisions")
-                    print("  Check that your LLM provider is running.")
-                    print(f"  BASE_URL: {self.ai.client.base_url}")
-                    print("=" * 60)
-                    break
-                continue
-
-            consecutive_timeouts = 0
-            debug_log.info(
-                f"DECISION: type={decision.question_type} "
-                f"confidence={decision.confidence} "
-                f"actions={len(decision.actions)} "
-                f"source={decision_source}",
+        # --- Decision result ---
+        if not decision:
+            debug_log.warning(
+                f"DECISION EMPTY (source={decision_source}) — retrying",
                 extra={"stage": "Decide"},
             )
-
-            if decision.question_type == "completion":
-                debug_log.info(
-                    "Completion detected by AI", extra={"stage": "Loop"}
+            consecutive_timeouts += 1
+            consecutive_timeouts_cell[0] = consecutive_timeouts
+            if consecutive_timeouts >= 5:
+                debug_log.error(
+                    f"PROVIDER DOWN: {consecutive_timeouts} consecutive "
+                    "empty decisions. Check that your LLM provider is "
+                    "running at the configured BASE_URL.",
+                    extra={"stage": "Decide"},
                 )
-                break
+                print("\n" + "=" * 60)
+                print("PROVIDER DOWN — LOOP STOPPED")
+                print(f"  {consecutive_timeouts} consecutive empty decisions")
+                print("  Check that your LLM provider is running.")
+                print(f"  BASE_URL: {self.ai.client.base_url}")
+                print("=" * 60)
+                return None
+            return True
 
-            # --- Execute actions ---
-            pre_fp = self._page_fingerprint()
-            action_results = []
-            with StageTimer(debug_log, "execute_actions", threshold=3.0):
-                for act in decision.actions:
+        consecutive_timeouts = 0
+        consecutive_timeouts_cell[0] = 0
+        debug_log.info(
+            f"DECISION: type={decision.question_type} "
+            f"confidence={decision.confidence} "
+            f"actions={len(decision.actions)} "
+            f"source={decision_source}",
+            extra={"stage": "Decide"},
+        )
+
+        if decision.question_type == "completion":
+            debug_log.info(
+                "Completion detected by AI", extra={"stage": "Loop"}
+            )
+            return None
+
+        # --- Execute actions ---
+        self.guard.set_state(BotState.ANSWER_ACTION)
+        pre_fp = self._page_fingerprint()
+        action_results = []
+        with StageTimer(debug_log, "execute_actions", threshold=3.0):
+            for act in decision.actions:
+                debug_log.debug(
+                    f"ACTION: type={act.action_type} "
+                    f"element_id={act.element_id} "
+                    f"value={str(act.value)[:50] if act.value else 'None'} "
+                    f"coords={act.coordinates} "
+                    f"reasoning={act.reasoning[:80]}",
+                    extra={"stage": "Action"},
+                )
+                pre_fp = self._page_fingerprint()
+                action_ok = False
+                try:
+                    if act.action_type == "click":
+                        if act.element_id is not None:
+                            self.browser.click_element(act.element_id)
+                            action_ok = True
+                        elif act.coordinates:
+                            self.browser.click_coords(*act.coordinates)
+                            action_ok = True
+                    elif act.action_type == "type":
+                        if act.element_id is not None and act.value:
+                            self.browser.type_into(
+                                act.element_id, act.value
+                            )
+                            action_ok = True
+                    elif act.action_type == "select_multi":
+                        if act.value:
+                            for part in act.value.split(","):
+                                part = part.strip()
+                                if part.isdigit():
+                                    self.browser.click_element(int(part))
+                                else:
+                                    for el in elements:
+                                        if part.lower() in el["text"].lower():
+                                            self.browser.click_element(el["id"])
+                                            break
+                            action_ok = True
+                    elif act.action_type == "scroll":
+                        self.browser.scroll_random()
+                        action_ok = True
+                    elif act.action_type == "next":
+                        self.browser.click_next()
+                        action_ok = True
+                    elif act.action_type == "wait":
+                        time.sleep(2)
+                        action_ok = True
+                    elif act.action_type == "human_help":
+                        debug_log.warning(
+                            "MANUAL HELP NEEDED — waiting for user",
+                            extra={"stage": "Action"},
+                        )
+                        print("\n" + "=" * 50)
+                        print("MANUAL HELP NEEDED")
+                        print(f"URL: {current_url}")
+                        print("=" * 50)
+                        input("Press ENTER after manually fixing the page...")
+                        action_ok = True
+
                     debug_log.debug(
-                        f"ACTION: type={act.action_type} "
-                        f"element_id={act.element_id} "
-                        f"value={str(act.value)[:50] if act.value else 'None'} "
-                        f"coords={act.coordinates} "
-                        f"reasoning={act.reasoning[:80]}",
+                        f"ACTION RESULT: type={act.action_type} ok={action_ok}",
                         extra={"stage": "Action"},
                     )
-                    pre_fp = self._page_fingerprint()
+
+                except Exception as e:
+                    debug_log.error(
+                        f"ACTION FAILED: type={act.action_type} error={e}",
+                        extra={"stage": "Action"},
+                        exc_info=True,
+                    )
                     action_ok = False
-                    try:
-                        if act.action_type == "click":
-                            if act.element_id is not None:
-                                self.browser.click_element(act.element_id)
-                                action_ok = True
-                            elif act.coordinates:
-                                self.browser.click_coords(*act.coordinates)
-                                action_ok = True
-                        elif act.action_type == "type":
-                            if act.element_id is not None and act.value:
-                                self.browser.type_into(
-                                    act.element_id, act.value
-                                )
-                                action_ok = True
-                        elif act.action_type == "select_multi":
-                            if act.value:
-                                for part in act.value.split(","):
-                                    part = part.strip()
-                                    if part.isdigit():
-                                        self.browser.click_element(int(part))
-                                    else:
-                                        for el in elements:
-                                            if part.lower() in el["text"].lower():
-                                                self.browser.click_element(el["id"])
-                                                break
-                                action_ok = True
-                        elif act.action_type == "scroll":
-                            self.browser.scroll_random()
-                            action_ok = True
-                        elif act.action_type == "next":
-                            self.browser.click_next()
-                            action_ok = True
-                        elif act.action_type == "wait":
-                            time.sleep(2)
-                            action_ok = True
-                        elif act.action_type == "human_help":
-                            debug_log.warning(
-                                "MANUAL HELP NEEDED — waiting for user",
+                    if act.coordinates and act.action_type in ("click", "type"):
+                        try:
+                            self.browser.click_coords(*act.coordinates)
+                            debug_log.debug(
+                                "Fallback coordinate click succeeded",
                                 extra={"stage": "Action"},
                             )
-                            print("\n" + "=" * 50)
-                            print("MANUAL HELP NEEDED")
-                            print(f"URL: {current_url}")
-                            print("=" * 50)
-                            input("Press ENTER after manually fixing the page...")
-                            action_ok = True
-
-                        debug_log.debug(
-                            f"ACTION RESULT: type={act.action_type} ok={action_ok}",
-                            extra={"stage": "Action"},
-                        )
-
-                    except Exception as e:
-                        debug_log.error(
-                            f"ACTION FAILED: type={act.action_type} error={e}",
-                            extra={"stage": "Action"},
-                            exc_info=True,
-                        )
-                        action_ok = False
-                        if act.coordinates and act.action_type in ("click", "type"):
-                            try:
-                                self.browser.click_coords(*act.coordinates)
-                                debug_log.debug(
-                                    "Fallback coordinate click succeeded",
-                                    extra={"stage": "Action"},
-                                )
-                            except Exception as e2:
-                                debug_log.error(
-                                    f"Fallback click also failed: {e2}",
-                                    extra={"stage": "Action"},
-                                    exc_info=True,
-                                )
-
-                    # Verify action had effect
-                    if act.action_type != "wait":
-                        with StageTimer(debug_log, "verify_action"):
-                            if not self._verify_action(pre_fp):
-                                debug_log.warning(
-                                    f"Action {act.action_type} had no effect",
-                                    extra={"stage": "Verify"},
-                                )
-                                if act.coordinates and act.action_type == "click":
-                                    try:
-                                        self.browser.click_coords(*act.coordinates)
-                                    except Exception as e:
-                                        debug_log.error(
-                                            f"Verify fallback failed: {e}",
-                                            extra={"stage": "Verify"},
-                                            exc_info=True,
-                                        )
-
-                    action_results.append(action_ok)
-
-            # --- Auto-click Next if needed ---
-            with StageTimer(debug_log, "auto_next"):
-                has_next = any(a.action_type == "next" for a in decision.actions)
-                if not has_next:
-                    qtypes = ("single_choice", "multi_choice", "text", "dropdown", "grid")
-                    if decision.question_type in qtypes:
-                        time.sleep(0.5)
-                        if self.browser.click_next():
-                            debug_log.info(
-                                "Auto-clicked Next", extra={"stage": "Nav"}
+                        except Exception as e2:
+                            debug_log.error(
+                                f"Fallback click also failed: {e2}",
+                                extra={"stage": "Action"},
+                                exc_info=True,
                             )
 
-            # --- Memory & cache ---
-            if decision.memory_note:
-                self.ai.memory.append(decision.memory_note)
-            if decision and decision.memory_note and decision.question_type not in ("completion", "unknown"):
-                self.cache.set(page_text[:500], options_texts, {
-                    "memory_note": decision.memory_note,
-                    "answer_summary": decision.page_summary[:200],
-                    "question_type": decision.question_type,
-                })
+                # Verify action had effect
+                if act.action_type != "wait":
+                    with StageTimer(debug_log, "verify_action"):
+                        if not self._verify_action(pre_fp):
+                            debug_log.warning(
+                                f"Action {act.action_type} had no effect",
+                                extra={"stage": "Verify"},
+                            )
+                            if act.coordinates and act.action_type == "click":
+                                try:
+                                    self.browser.click_coords(*act.coordinates)
+                                except Exception as e:
+                                    debug_log.error(
+                                        f"Verify fallback failed: {e}",
+                                        extra={"stage": "Verify"},
+                                        exc_info=True,
+                                    )
 
-            # --- Stuck detection ---
-            page_fp = self._page_fingerprint()
-            question_text = page_text[:200]
-            diag = _stuck_detector.update(current_url, page_fp, question_text)
+                action_results.append(action_ok)
 
-            # --- Iteration summary ---
-            iter_elapsed = time.perf_counter() - iter_start
-            debug_log.info(
-                f"Iteration={loop_iteration} completed in {iter_elapsed:.2f}s | "
-                f"url_changed={diag['url_changed']} | "
-                f"question_changed={diag['question_changed']} | "
-                f"fingerprint_changed={diag['fingerprint_changed']} | "
-                f"actions_executed={len(action_results)} | "
-                f"actions_ok={sum(action_results)} | "
-                f"same_state_count={diag['same_state_count']} | "
-                f"stuck_for={diag['stuck_elapsed_s']}s",
+        # --- Auto-click Next if needed ---
+        self.guard.set_state(BotState.WAITING_FOR_NAVIGATION)
+        with StageTimer(debug_log, "auto_next"):
+            has_next = any(a.action_type == "next" for a in decision.actions)
+            if not has_next:
+                qtypes = ("single_choice", "multi_choice", "text", "dropdown", "grid")
+                if decision.question_type in qtypes:
+                    time.sleep(0.5)
+                    if self.browser.click_next():
+                        debug_log.info(
+                            "Auto-clicked Next", extra={"stage": "Nav"}
+                        )
+
+        # --- Memory & cache ---
+        if decision.memory_note:
+            self.ai.memory.append(decision.memory_note)
+        if decision and decision.memory_note and decision.question_type not in ("completion", "unknown"):
+            self.cache.set(page_text[:500], options_texts, {
+                "memory_note": decision.memory_note,
+                "answer_summary": decision.page_summary[:200],
+                "question_type": decision.question_type,
+            })
+
+        # --- Stuck detection ---
+        page_fp = self._page_fingerprint()
+        question_text = page_text[:200]
+        diag = _stuck_detector.update(current_url, page_fp, question_text)
+
+        # --- Iteration summary ---
+        iter_elapsed = time.perf_counter() - iter_start
+        debug_log.info(
+            f"Iteration={loop_iteration} completed in {iter_elapsed:.2f}s | "
+            f"url_changed={diag['url_changed']} | "
+            f"question_changed={diag['question_changed']} | "
+            f"fingerprint_changed={diag['fingerprint_changed']} | "
+            f"actions_executed={len(action_results)} | "
+            f"actions_ok={sum(action_results)} | "
+            f"same_state_count={diag['same_state_count']} | "
+            f"stuck_for={diag['stuck_elapsed_s']}s",
+            extra={"stage": "Summary"},
+        )
+
+        # Slow iteration warning
+        if iter_elapsed > 30:
+            debug_log.warning(
+                f"SLOW iteration: {iter_elapsed:.1f}s — check timing breakdown above",
                 extra={"stage": "Summary"},
             )
 
-            # Slow iteration warning
-            if iter_elapsed > 30:
-                debug_log.warning(
-                    f"SLOW iteration: {iter_elapsed:.1f}s — check timing breakdown above",
-                    extra={"stage": "Summary"},
-                )
+        return False  # success → continue with timeout counter reset
 
     def stop(self):
         self.browser.stop()
