@@ -1,0 +1,47 @@
+From 282ba085844fe970b5b508352d95962b844862fb Mon Sep 17 00:00:00 2001
+From: shaarrpie <169646651+shaarrpie@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 01:58:42 +0000
+Subject: [PATCH] core.py: forensic fixes 5-8 (F12 latch reset, empty-map
+ guard, honest verify metrics, empty-map census)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Change 5: reset window.__sentinelStartKey in run_interactive finally -
+  kills the 0.5s auto-restart after every loop exit (incident 2).
+Change 6: NO_ACTIONABLE_ELEMENTS guard - refuse blind
+  click/type/select_multi/next when the element map is empty.
+Change 7: actions_verified=N/N in the iteration summary; verification
+  result captured separately from actions_ok (no-exception) semantics.
+Change 8: ELEMENT MAP EMPTY census (matches/hidden_null/small/
+  readyState/visibilityState) on top-document zero-element scans.
+
+Changes 1-4 (viewport-origin W3C clicks, ACTION START geometry log,
+classified bounded recovery, live re-acquisition) verified already
+present in 852f316 - not re-applied.
+
+Verified: compileall + import clean; test_loop_breaker 9/9;
+test_panel_hub_matcher (py + node) pass. smoke_survey_test not
+runnable in this sandbox (no Chromium available).
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ core.py | 71 ++++++++++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 68 insertions(+), 3 deletions(-)
+
+diff --git a/core.py b/core.py
+index dcda2fa..5b1f710 100644
+--- a/core.py
++++ b/core.py
+@@ -392,6 +392,42 @@ class BrowserController:
+                 extra={"stage": "Elements"},
+             )
+             return
++        # Census diagnostic - ONLY when the top document's scan returned
++        # nothing. Distinguishes H1 "page never rendered interactive UI"
++        # (matches=0), H2 "elements exist but all filtered out"
++        # (matches>0 with hidden_null/small), and H3 "document not ready"
++        # (readyState). Purely additive - never alters the scan result.
++        if frame_index is None and not (result or []):
++            try:
++       

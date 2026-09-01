@@ -405,6 +405,47 @@ class BrowserController:
                 self._element_frames[entry["id"]] = frame_index
             elements.append(entry)
 
+        # Census diagnostic — ONLY when the top document's scan returned
+        # nothing. Distinguishes H1 "page never rendered interactive UI"
+        # (matches=0), H2 "elements exist but all filtered out"
+        # (matches>0 with hidden_null/small), and H3 "document not ready"
+        # (readyState/visibilityState). Purely additive — never alters
+        # the scan result.
+        if frame_index is None and not (result or []):
+            try:
+                census = self.driver.execute_script("""
+                    var selector = 'button, input, select, textarea, a, label, [onclick], [role="button"], [role="link"]';
+                    var all = document.querySelectorAll(selector);
+                    var matches = all.length;
+                    var hidden_null = 0, small = 0;
+                    all.forEach(function(el) {
+                        if (el.offsetParent === null) hidden_null++;
+                        var r = el.getBoundingClientRect();
+                        if (r.width < 5 || r.height < 5) small++;
+                    });
+                    return {
+                        matches: matches,
+                        hidden_null: hidden_null,
+                        small: small,
+                        readyState: document.readyState,
+                        visibilityState: document.visibilityState
+                    };
+                """)
+                debug_log.warning(
+                    f"ELEMENT MAP EMPTY | frame=top | "
+                    f"matches={census['matches']} "
+                    f"hidden_null={census['hidden_null']} "
+                    f"small={census['small']} | "
+                    f"readyState={census['readyState']} | "
+                    f"visibilityState={census['visibilityState']}",
+                    extra={"stage": "QuestionDetection"},
+                )
+            except Exception as e:
+                debug_log.warning(
+                    f"ELEMENT MAP EMPTY census_failed: {e}",
+                    extra={"stage": "QuestionDetection"},
+                )
+
     def get_page_text(self) -> str:
         return self.driver.find_element(By.TAG_NAME, "body").text
 
@@ -1295,6 +1336,18 @@ class SurveyBot:
                             self._run_survey_loop()
                         finally:
                             started = False
+                            # Re-arm the start latch: without this the previous
+                            # "F12" stays in window.__sentinelStartKey and the
+                            # poll loop auto-restarts the survey 0.5 s after
+                            # every loop exit (852f316 regression).
+                            try:
+                                driver.execute_script(
+                                    "window.__sentinelStartKey = null;")
+                            except Exception:
+                                logger.debug(
+                                    "sentinel start-key reset failed",
+                                    exc_info=True,
+                                )
                         if self.guard.state != BotState.STOPPED:
                             self.guard.set_state(BotState.WAITING_FOR_F12)
                             debug_log.info(
@@ -1659,6 +1712,7 @@ class SurveyBot:
         self.guard.set_state(BotState.ANSWER_ACTION)
         pre_fp = self._page_fingerprint()
         action_results = []
+        verified_results = []
         with StageTimer(debug_log, "execute_actions", threshold=3.0):
             for act in decision.actions:
                 debug_log.debug(
@@ -1669,6 +1723,21 @@ class SurveyBot:
                     f"reasoning={act.reasoning[:80]}",
                     extra={"stage": "Action"},
                 )
+                # An empty element map (or a scan that returned nothing —
+                # page not rendered / wrong browsing context) means no
+                # interactive target can exist. Refuse blind clicks/types
+                # loudly instead of churning unverifiable guesses; escalate
+                # via the stuck detector / human_help path.
+                if not elements and act.action_type in (
+                        "click", "type", "select_multi", "next"):
+                    debug_log.error(
+                        f"NO_ACTIONABLE_ELEMENTS | element map empty — refusing "
+                        f"blind {act.action_type} (page likely not interactive); "
+                        f"escalate via stuck/human_help path",
+                        extra={"stage": "Action"},
+                    )
+                    action_results.append(False)
+                    continue
                 # Guard against hallucinated element_ids: the AI only sees the
                 # element map captured this iteration, so any id outside it
                 # cannot exist in the DOM (typical when the map is empty
@@ -1875,9 +1944,11 @@ class SurveyBot:
                             )
 
                 # Verify action had effect
+                verified = None
                 if act.action_type != "wait":
                     with StageTimer(debug_log, "verify_action"):
-                        if not self._verify_action(pre_fp):
+                        verified = self._verify_action(pre_fp)
+                        if not verified:
                             debug_log.warning(
                                 f"Action {act.action_type} had no effect",
                                 extra={"stage": "Verify"},
@@ -1891,7 +1962,8 @@ class SurveyBot:
                             # NO third identical click — stop touching this
                             # action.  The existing stuck detector and
                             # human_help escalation handle long-term recovery.
-
+                if verified is not None:
+                    verified_results.append(verified)
                 action_results.append(action_ok)
 
         # --- Auto-click Next if needed ---
@@ -1931,6 +2003,7 @@ class SurveyBot:
             f"fingerprint_changed={diag['fingerprint_changed']} | "
             f"actions_executed={len(action_results)} | "
             f"actions_ok={sum(action_results)} | "
+            f"actions_verified={sum(verified_results)}/{len(verified_results)} | "
             f"same_state_count={diag['same_state_count']} | "
             f"stuck_for={diag['stuck_elapsed_s']}s",
             extra={"stage": "Summary"},
