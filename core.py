@@ -104,6 +104,85 @@ class SurveyDecision(BaseModel):
     memory_note: Optional[str] = None
 
 
+def _levenshtein_ratio(s1: str, s2: str) -> float:
+    """Calculate similarity ratio between two strings (0.0 to 1.0).
+
+    Uses Levenshtein distance normalized by the longer string length.
+    Returns 1.0 for identical strings, 0.0 for completely different.
+    """
+    if not s1 and not s2:
+        return 1.0
+    if not s1 or not s2:
+        return 0.0
+
+    s1, s2 = s1.lower().strip(), s2.lower().strip()
+    if s1 == s2:
+        return 1.0
+
+    # Quick substring check (handles "Mumbai" matching "01 - Mumbai / Maharashtra")
+    if s1 in s2 or s2 in s1:
+        shorter = min(len(s1), len(s2))
+        longer = max(len(s1), len(s2))
+        return shorter / longer
+
+    # Levenshtein distance
+    len1, len2 = len(s1), len(s2)
+    if len1 < len2:
+        s1, s2 = s2, s1
+        len1, len2 = len2, len1
+
+    previous_row = range(len2 + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+
+    distance = previous_row[-1]
+    return 1.0 - (distance / len1)
+
+
+def fuzzy_match_option(target: str, options: List[dict], threshold: float = 0.8) -> Optional[dict]:
+    """Find the best matching option using fuzzy string matching.
+
+    Args:
+        target: The expected value/keyword to match (e.g., "Mumbai")
+        options: List of option dicts with 'text' and 'value' keys
+        threshold: Minimum similarity ratio (0.0-1.0) to accept a match
+
+    Returns:
+        The best matching option dict, or None if no match above threshold
+    """
+    if not target or not options:
+        return None
+
+    best_match = None
+    best_score = 0.0
+
+    for opt in options:
+        # Match against both text and value
+        text = opt.get("text", "")
+        value = opt.get("value", "")
+
+        # Check text similarity
+        text_score = _levenshtein_ratio(target, text)
+        # Check value similarity
+        value_score = _levenshtein_ratio(target, value)
+        # Use the higher score
+        score = max(text_score, value_score)
+
+        if score > best_score:
+            best_score = score
+            best_match = opt
+
+    if best_match and best_score >= threshold:
+        return best_match
+    return None
+
+
 def _fallback_decision(log, reason: str) -> Optional[SurveyDecision]:
     """Return a safe 'human_help' decision when the AI provider is unreachable.
     Prevents the survey loop from crashing — flags the page for human review."""
@@ -198,7 +277,7 @@ class BrowserController:
         self.driver.set_window_size(1280, 800)
 
         self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-            "source": "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+            "source": self._stealth_script()
         })
 
         self.driver.request_interceptor = self._intercept
@@ -225,6 +304,92 @@ class BrowserController:
                 self.disqualified = True
         except Exception:
             logger.debug("swallowed exception in core.py", exc_info=True)
+
+    @staticmethod
+    def _stealth_script() -> str:
+        """Comprehensive anti-detection script injected on every new document.
+
+        Patches navigator.plugins, navigator.languages, window.chrome,
+        Permissions.prototype.query, and WebGL vendor/renderer to appear
+        as a real Chrome browser. Without these, advanced bot detection
+        can identify automation even when navigator.webdriver is hidden.
+        """
+        return """
+        // ── navigator.webdriver ──────────────────────────────────────────
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+        // ── navigator.plugins ────────────────────────────────────────────
+        // Real browsers have plugins (Chrome PDF Viewer, Native Client, etc.)
+        const plugins = [
+            { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'Chrome PDF Plugin', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
+        ];
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => {
+                const arr = [...plugins];
+                arr.__proto__ = PluginArray.prototype;
+                return arr;
+            }
+        });
+
+        // ── navigator.languages ──────────────────────────────────────────
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en']
+        });
+        Object.defineProperty(navigator, 'language', {
+            get: () => 'en-US'
+        });
+
+        // ── window.chrome ────────────────────────────────────────────────
+        // Real Chrome has window.chrome object with runtime property
+        window.chrome = window.chrome || {};
+        if (!window.chrome.runtime) {
+            window.chrome.runtime = { PlatformOs: { MAC: 'mac', WIN: 'win', ANDROID: 'android', CROS: 'cros', LINUX: 'linux', OPENBSD: 'openbsd' }, OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' }, OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' }, Arch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' } };
+        }
+
+        // ── Permissions.prototype.query ──────────────────────────────────
+        // Patch to not reveal automation via permission queries
+        const originalQuery = window.Permissions?.prototype?.query;
+        if (originalQuery) {
+            window.Permissions.prototype.query = function(params) {
+                if (params.name === 'notifications') {
+                    return Promise.resolve({ state: Notification.permission });
+                }
+                return originalQuery.call(this, params);
+            };
+        }
+
+        // ── WebGL vendor/renderer ────────────────────────────────────────
+        // Spoof GPU info to avoid "SwiftShader" or "Mesa" detection
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(param) {
+            // UNMASKED_VENDOR_WEBGL = 0x9245
+            if (param === 0x9245) return 'Google Inc. (NVIDIA)';
+            // UNMASKED_RENDERER_WEBGL = 0x9246
+            if (param === 0x9246) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            return getParameter.call(this, param);
+        };
+        // Also patch WebGL2 if available
+        if (window.WebGL2RenderingContext) {
+            const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+            WebGL2RenderingContext.prototype.getParameter = function(param) {
+                if (param === 0x9245) return 'Google Inc. (NVIDIA)';
+                if (param === 0x9246) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+                return getParameter2.call(this, param);
+            };
+        }
+
+        // ── iframe contentWindow patch ───────────────────────────────────
+        // Ensure iframes inherit the same stealth properties
+        const originalAttachShadow = Element.prototype.attachShadow;
+        if (originalAttachShadow) {
+            Element.prototype.attachShadow = function() {
+                const shadow = originalAttachShadow.apply(this, arguments);
+                return shadow;
+            };
+        }
+        """
 
     def screenshot_b64(self, compress: bool = True) -> str:
         try:
@@ -286,6 +451,7 @@ class BrowserController:
             # ── Top document ──────────────────────────────────────────────
             self._scan_current_frame(elements, None, (0, 0))
             # ── All depth-1 iframes (no low cap; skip invisible) ──────────
+            try:
                 # execute_script per frame.
                 frames_meta = self.driver.execute_script("""
                     return Array.from(document.querySelectorAll('iframe')).map(
@@ -868,10 +1034,69 @@ class BrowserController:
         return any(x in text for x in ["thank you", "completed", "finished", "success", "your responses have been recorded"])
 
     def save_session(self):
-        pass
+        """Save cookies to disk for session persistence.
 
-    def load_session(self):
-        pass
+        Saves BEFORE navigation so if the bot crashes mid-survey,
+        the session state is preserved. This is non-destructive —
+        it doesn't refresh the page.
+        """
+        if not self.driver:
+            return
+        try:
+            cookies = self.driver.get_cookies()
+            cookie_path = os.path.join(self.profile_dir, "session_cookies.json")
+            with open(cookie_path, "w") as f:
+                json.dump(cookies, f, indent=2)
+            logger.debug(f"Saved {len(cookies)} cookies to {cookie_path}")
+        except Exception as e:
+            logger.debug(f"save_session failed: {e}", exc_info=True)
+
+    def load_session(self, refresh: bool = False) -> bool:
+        """Load cookies from disk to restore a previous session.
+
+        Args:
+            refresh: If True, refresh the page after loading cookies.
+                     Only should be True on initial navigation, NOT
+                     mid-survey (which would reset everything).
+
+        Returns:
+            True if cookies were loaded successfully
+        """
+        cookie_path = os.path.join(self.profile_dir, "session_cookies.json")
+        if not os.path.exists(cookie_path):
+            return False
+        try:
+            with open(cookie_path, "r") as f:
+                cookies = json.load(f)
+
+            # Navigate to the cookie domain first (required for setting cookies)
+            if cookies:
+                first_cookie = cookies[0]
+                domain = first_cookie.get("domain", "")
+                if domain:
+                    # Ensure we're on the right domain
+                    if not self.driver.current_url.startswith(f"https://{domain}"):
+                        self.driver.get(f"https://{domain}")
+
+            # Add cookies
+            for cookie in cookies:
+                try:
+                    # Remove problematic fields
+                    cookie.pop("sameSite", None)
+                    cookie.pop("storeId", None)
+                    self.driver.add_cookie(cookie)
+                except Exception:
+                    pass
+
+            # Only refresh on initial navigation, not mid-survey
+            if refresh:
+                self.driver.refresh()
+
+            logger.debug(f"Loaded {len(cookies)} cookies from {cookie_path}")
+            return True
+        except Exception as e:
+            logger.debug(f"load_session failed: {e}", exc_info=True)
+            return False
 
     def stop(self):
         if self.driver:
@@ -885,6 +1110,77 @@ class BrowserController:
                 except Exception:
                     logger.debug("service.stop() also failed", exc_info=True)
             self.driver = None  # no stale handle for poll loops to grab
+
+    def check_new_tabs(self) -> Optional[str]:
+        """Check for newly opened tabs/windows.
+
+        Survey routers (CPX Research, Dynata) often open new tabs mid-survey.
+        This method detects new window handles and returns the URL of the
+        most recently opened tab, or None if no new tabs.
+
+        Returns:
+            URL of new tab if detected, None otherwise
+        """
+        if not self.driver:
+            return None
+        try:
+            current_handles = set(self.driver.window_handles)
+            # Initialize known handles on first call
+            if not hasattr(self, '_known_window_handles') or not self._known_window_handles:
+                self._known_window_handles = current_handles
+                return None
+
+            new_handles = current_handles - self._known_window_handles
+            if new_handles:
+                # New tab detected — switch to it and get URL
+                new_handle = list(new_handles)[-1]  # most recent
+                self.driver.switch_to.window(new_handle)
+                new_url = self.driver.current_url
+                debug_log.info(
+                    f"NEW TAB DETECTED | url={new_url[:100]} | "
+                    f"total_tabs={len(current_handles)}",
+                    extra={"stage": "TabMonitor"},
+                )
+                # Update known handles
+                self._known_window_handles = current_handles
+                return new_url
+
+            # Check for closed tabs
+            closed = self._known_window_handles - current_handles
+            if closed:
+                self._known_window_handles = current_handles
+                # If our tab was closed, switch to remaining tab
+                if len(current_handles) > 0:
+                    self.driver.switch_to.window(list(current_handles)[0])
+
+            return None
+        except Exception as e:
+            logger.debug(f"check_new_tabs failed: {e}", exc_info=True)
+            return None
+
+    def close_extra_tabs(self):
+        """Close all tabs except the current one.
+
+        Useful for cleaning up tabs opened by survey routers.
+        """
+        if not self.driver:
+            return
+        try:
+            handles = self.driver.window_handles
+            if len(handles) <= 1:
+                return
+            current = self.driver.current_window_handle
+            for handle in handles:
+                if handle != current:
+                    self.driver.switch_to.window(handle)
+                    self.driver.close()
+            self.driver.switch_to.window(current)
+            debug_log.info(
+                f"CLOSED EXTRA TABS | remaining=1",
+                extra={"stage": "TabMonitor"},
+            )
+        except Exception as e:
+            logger.debug(f"close_extra_tabs failed: {e}", exc_info=True)
 
 class AIEngine:
     COMMON_ANSWERS = {
@@ -994,6 +1290,54 @@ class AIEngine:
                                    value=answer, reasoning=f"heuristic: {keyword}")]
         return None
 
+    def sniper_match_dropdown(self, target_value: str, elements: List[dict], threshold: float = 0.8) -> Optional[Action]:
+        """Fuzzy-match a dropdown option for sniper mode.
+
+        Handles cases where the persona says "Mumbai" but the dropdown
+        has "01 - Mumbai / Maharashtra". Uses Levenshtein distance
+        instead of substring search.
+
+        Args:
+            target_value: The expected value from persona (e.g., "Mumbai")
+            elements: Element map to search for select elements
+            threshold: Minimum similarity ratio to accept
+
+        Returns:
+            Action to select the matched option, or None if no good match
+        """
+        # Find all select elements in the map
+        selects = [e for e in elements if e.get("tag") == "select"]
+        if not selects:
+            return None
+
+        for select_elem in selects:
+            options = select_elem.get("options", [])
+            if not options:
+                continue
+
+            # Try fuzzy match against all options
+            match = fuzzy_match_option(target_value, options, threshold)
+            if match:
+                debug_log.info(
+                    f"SNIPER MATCH | target='{target_value}' -> "
+                    f"'{match.get('text', match.get('value', ''))}' "
+                    f"(element_id={select_elem['id']})",
+                    extra={"stage": "Sniper"},
+                )
+                return Action(
+                    action_type="select_option",
+                    element_id=select_elem["id"],
+                    value=match.get("value", match.get("text", "")),
+                    reasoning=f"sniper: fuzzy match '{target_value}'",
+                )
+
+        # No match above threshold — log for debugging
+        debug_log.debug(
+            f"SNIPER NO MATCH | target='{target_value}' — no option above {threshold} similarity",
+            extra={"stage": "Sniper"},
+        )
+        return None
+
     def decide(
         self,
         screenshot_b64: str,
@@ -1003,6 +1347,7 @@ class AIEngine:
         viewport: Optional[tuple] = None,
         page_title: str = "",
         frame_info: Optional[List[dict]] = None,
+        detected_type: Optional[str] = None,
     ) -> Optional[SurveyDecision]:
         global _ai_consecutive_failures, _ai_first_failure_at, _last_failure_category
 
@@ -1037,6 +1382,9 @@ class AIEngine:
         else:
             frames_block = "No iframes detected (all elements are in the top document)."
 
+        # Detected question type — helps the AI understand the question format
+        type_hint = f"Detected question type: {detected_type}" if detected_type and detected_type != "unknown" else ""
+
         def _build_prompt(budget: int) -> str:
             return f"""Analyze the survey screenshot and element map. Decide the next action(s).
 
@@ -1044,6 +1392,7 @@ URL: {url}
 Title: {page_title[:150] or "(unknown)"}
 Viewport: {vw}x{vh} CSS pixels (click coordinates are in this space)
 Frames: {frames_block}
+{type_hint}
 Page text excerpt: {page_text[:2500]}
 
 Interactive elements (id, tag, type, text, center coordinates):
@@ -1348,11 +1697,300 @@ class SurveyBot:
         self.last_action_fingerprint: Optional[str] = None
         self.profile_name = profile_name
         self.guard = SessionGuard(debug_log)
+        # Tab monitoring state
+        self._known_window_handles: set = set()
+        self._original_window: Optional[str] = None
+
+    def _extract_persona_keywords(self, page_text: str) -> List[str]:
+        """Extract persona keywords relevant for dropdown matching.
+
+        Looks for demographic/location keywords from the persona that
+        might appear in dropdown options. This feeds the sniper mode
+        fuzzy matching.
+        """
+        keywords = []
+        # Common demographic dropdown categories
+        dropdown_categories = [
+            "city", "state", "country", "location", "region",
+            "gender", "age", "income", "education", "employment",
+            "industry", "occupation", "language", "ethnicity",
+            "marital status", "household", "zip", "postal"
+        ]
+
+        # Try to load persona from profile
+        try:
+            persona = get_persona()
+            # Extract values from persona (simple extraction)
+            persona_lower = persona.lower()
+
+            # Look for key-value patterns in persona
+            for category in dropdown_categories:
+                if category in persona_lower:
+                    # Extract the value after the category
+                    import re
+                    patterns = [
+                        rf"{category}[:\s]+([^\n,]+)",
+                        rf"{category}\s+is\s+([^\n,]+)",
+                        rf"my\s+{category}[:\s]+([^\n,]+)",
+                    ]
+                    for pattern in patterns:
+                        match = re.search(pattern, persona_lower)
+                        if match:
+                            value = match.group(1).strip()
+                            if value and len(value) > 1:
+                                keywords.append(value)
+        except Exception:
+            logger.debug("Failed to extract persona keywords", exc_info=True)
+
+        # Also add common answers from AIEngine
+        keywords.extend([
+            "Female", "Male",  # gender
+            "32", "25", "28", "35",  # age
+            "Mumbai", "Delhi", "Bangalore", "Chennai", "Kolkata",  # Indian cities
+            "Graduate", "Post Graduate",  # education
+            "Full-time", "Part-time", "Self-employed",  # employment
+            "Information Technology",  # industry
+        ])
+
+        return list(set(keywords))  # deduplicate
+
+    @staticmethod
+    def detect_question_type(elements: List[dict]) -> str:
+        """Detect question type from element structure.
+
+        Analyzes the element map to determine if this is single-choice,
+        multi-select, dropdown, text, or grid. Used to enforce correct
+        execution behavior (e.g., only one click for single-choice).
+        """
+        radios = [e for e in elements if e.get("type") == "radio"]
+        checkboxes = [e for e in elements if e.get("type") == "checkbox"]
+        selects = [e for e in elements if e.get("tag") == "select"]
+        text_inputs = [e for e in elements if e.get("type") in ("text", "number", "email", "tel", "date")]
+
+        # Grid detection: many radios with row-like structure
+        if len(radios) > 10:
+            # Check if radios share names in a grid pattern (matrix question)
+            name_groups = {}
+            for r in radios:
+                name = r.get("name", "")
+                name_groups[name] = name_groups.get(name, 0) + 1
+            # If we have multiple groups of radios, it's likely a grid
+            multi_groups = [n for n, count in name_groups.items() if count > 1]
+            if len(multi_groups) >= 2:
+                return "grid"
+
+        # Single choice: radios without checkboxes
+        if len(radios) > 0 and len(checkboxes) == 0:
+            return "single_choice"
+
+        # Multi-select: checkboxes present
+        if len(checkboxes) > 0:
+            return "multi_select"
+
+        # Dropdown: select elements
+        if len(selects) > 0:
+            return "dropdown"
+
+        # Open-ended: text inputs without radios/checkboxes
+        if len(text_inputs) > 0 and len(radios) == 0 and len(checkboxes) == 0:
+            return "text"
+
+        # Check for contenteditable elements
+        editables = [e for e in elements if e.get("type") == "editable" or e.get("tag") == "[contenteditable]"]
+        if editables:
+            return "text"
+
+        return "unknown"
+
+    @staticmethod
+    def enforce_question_type(actions: List[Action], question_type: str) -> List[Action]:
+        """Enforce question type constraints on actions.
+
+        For single_choice: only execute the first click action.
+        For dropdown: prioritize select_option over click.
+        For grid: ensure all rows are answered.
+
+        This prevents the AI from hallucinating multiple clicks for
+        single-choice questions.
+        """
+        if question_type == "single_choice":
+            # Only allow one click action for single-choice
+            click_actions = [a for a in actions if a.action_type == "click"]
+            if len(click_actions) > 1:
+                # Keep only the first click, plus any non-click actions
+                first_click = click_actions[0]
+                non_clicks = [a for a in actions if a.action_type != "click"]
+                return [first_click] + non_clicks
+
+        elif question_type == "grid":
+            # For grid questions, ensure we have click actions for each row
+            # Don't filter — the AI should provide row-by-row answers
+            pass
+
+        elif question_type == "dropdown":
+            # For dropdowns, convert click actions to select_option if possible
+            enforced = []
+            for act in actions:
+                if act.action_type == "click" and act.value:
+                    enforced.append(Action(
+                        action_type="select_option",
+                        element_id=act.element_id,
+                        value=act.value,
+                        reasoning=act.reasoning,
+                    ))
+                else:
+                    enforced.append(act)
+            return enforced
+
+        return actions
+
+    @staticmethod
+    def calculate_reading_time(question_type: str, elements: List[dict], page_text: str) -> float:
+        """Calculate realistic reading time based on question complexity.
+
+        Humans read at different speeds depending on question type:
+        - Single radio: 2-4 seconds
+        - Grid with 10 rows: 8-15 seconds
+        - Open-ended text: 10-20 seconds
+        - Multi-select: 4-8 seconds
+        - Dropdown: 3-6 seconds
+
+        Args:
+            question_type: Detected question type
+            elements: Element map for counting options
+            page_text: Page text for word count
+
+        Returns:
+            Recommended reading delay in seconds
+        """
+        # Base times by question type
+        base_times = {
+            "single_choice": (2.0, 4.0),
+            "multi_choice": (4.0, 8.0),
+            "dropdown": (3.0, 6.0),
+            "text": (10.0, 20.0),
+            "grid": (8.0, 15.0),
+            "mixed": (5.0, 10.0),
+            "unknown": (3.0, 6.0),
+        }
+
+        min_time, max_time = base_times.get(question_type, (3.0, 6.0))
+
+        # Adjust based on number of options (more options = more reading)
+        num_options = len([e for e in elements if e.get("type") in ("radio", "checkbox")])
+        if num_options > 5:
+            # Add 0.5s per additional option beyond 5
+            extra_options = min(num_options - 5, 20)  # cap at 20 extra
+            min_time += extra_options * 0.5
+            max_time += extra_options * 0.5
+
+        # Adjust based on text length (for open-ended questions)
+        if question_type == "text":
+            word_count = len(page_text.split())
+            if word_count > 50:
+                # Add time for reading longer questions
+                min_time += min(word_count / 50, 10)  # cap at 10 extra seconds
+                max_time += min(word_count / 30, 15)
+
+        return random.uniform(min_time, max_time)
 
     def _page_fingerprint(self) -> str:
         text = self.browser.get_page_text()[:3000]
         url = self.browser.get_url()
         return hashlib.md5(f"{url}::{text}".encode()).hexdigest()
+
+    def _structural_fingerprint(self) -> str:
+        """Hash the DOM structure of the question container only.
+
+        Includes: tag names, name attributes, for attributes, option values.
+        Excludes: text content, timers, ads, dynamic fluff.
+
+        This catches actual question changes while ignoring:
+        - Timer updates ("You have 4:32 remaining")
+        - Ad rotations
+        - Dynamic text that doesn't affect question structure
+        """
+        try:
+            structural = self.browser.driver.execute_script("""
+                // Find the question container — survey pages typically wrap
+                // the active question in a container with role or class hints.
+                // Fall back to body if no specific container found.
+                const container = document.querySelector(
+                    '[role="main"], .question-container, .survey-question, ' +
+                    '.quiz-question, [data-question], #question, ' +
+                    '.form-group, fieldset'
+                ) || document.body;
+
+                // Walk the DOM tree and build a structural signature
+                const parts = [];
+                const walker = document.createTreeWalker(
+                    container,
+                    NodeFilter.SHOW_ELEMENT,
+                    {
+                        acceptNode: (node) => {
+                            // Skip dynamic/timer elements
+                            const tag = node.tagName.toLowerCase();
+                            const cls = (node.className || '').toString();
+                            const id = node.id || '';
+
+                            // Skip nav, footer, ads, timers, scripts
+                            if (['nav', 'footer', 'script', 'style', 'noscript'].includes(tag)) {
+                                return NodeFilter.FILTER_REJECT;
+                            }
+                            if (cls.match(/\b(timer|countdown|clock|ad|advert|banner|social|share)\b/i)) {
+                                return NodeFilter.FILTER_REJECT;
+                            }
+                            if (id.match(/\b(timer|countdown|clock|ad|advert|banner)\b/i)) {
+                                return NodeFilter.FILTER_REJECT;
+                            }
+                            // Skip hidden elements
+                            if (node.offsetParent === null) {
+                                return NodeFilter.FILTER_REJECT;
+                            }
+                            return NodeFilter.FILTER_ACCEPT;
+                        }
+                    }
+                );
+
+                let node;
+                while ((node = walker.nextNode()) !== null) {
+                    const tag = node.tagName.toLowerCase();
+                    const name = node.getAttribute('name') || '';
+                    const forAttr = node.getAttribute('for') || '';
+                    const role = node.getAttribute('role') || '';
+                    const type = node.getAttribute('type') || '';
+                    const inputType = node.type || '';
+
+                    // Build structural token (NO text content)
+                    let token = tag;
+                    if (name) token += `[name=${name}]`;
+                    if (forAttr) token += `[for=${forAttr}]`;
+                    if (role) token += `[role=${role}]`;
+                    if (type) token += `[type=${type}]`;
+                    if (inputType && inputType !== tag) token += `[input=${inputType}]`;
+
+                    // For select elements, include option values (not text)
+                    if (tag === 'select') {
+                        const opts = Array.from(node.options).map(o => o.value).join(',');
+                        token += `{opts=${opts}}`;
+                    }
+
+                    // For radio/checkbox, include checked state
+                    if (inputType === 'radio' || inputType === 'checkbox') {
+                        token += `{checked=${node.checked ? 1 : 0}}`;
+                    }
+
+                    parts.push(token);
+                }
+
+                return parts.join('|');
+            """)
+            if structural:
+                return hashlib.md5(structural.encode()).hexdigest()
+        except Exception:
+            logger.debug("structural fingerprint failed", exc_info=True)
+        # Fallback to text-based fingerprint
+        return self._page_fingerprint()
 
     @staticmethod
     def _nearest_element(
@@ -1762,6 +2400,25 @@ class SurveyBot:
                 extra={"stage": "Capture"},
             )
 
+        # --- Tab monitoring ---
+        # Survey routers (CPX Research, Dynata) often open new tabs mid-survey.
+        # Check for new tabs and handle them.
+        with StageTimer(debug_log, "check_tabs"):
+            new_tab_url = self.browser.check_new_tabs()
+            if new_tab_url:
+                debug_log.info(
+                    f"NEW TAB HANDLED | url={new_tab_url[:100]} — "
+                    f"closing extra tabs to maintain single-tab flow",
+                    extra={"stage": "TabMonitor"},
+                )
+                # Close extra tabs to maintain single-tab flow
+                self.browser.close_extra_tabs()
+                # Re-capture state after tab handling
+                screenshot = self.browser.screenshot_b64()
+                elements = self.browser.get_element_map()
+                page_text = self.browser.get_page_text()
+                current_url = self.browser.get_url()
+
             if not screenshot:
                 debug_log.warning(
                     "Screenshot is empty, skipping iteration",
@@ -1778,9 +2435,11 @@ class SurveyBot:
             visible_elements = sum(
                 1 for e in elements if e.get("text") or e.get("tag")
             )
+            # Detect question type from element structure
+            detected_type = self.detect_question_type(elements)
             debug_log.debug(
                 f"Elements: total={len(elements)} visible={visible_elements} "
-                f"with_text={len(options_texts)}",
+                f"with_text={len(options_texts)} detected_type={detected_type}",
                 extra={"stage": "Elements"},
             )
 
@@ -1806,6 +2465,17 @@ class SurveyBot:
                     f"with: {cached}. Use the same answer.]"
                 )
 
+        # --- Reading delay (variable based on question complexity) ---
+        # Humans don't answer instantly — they read the question first.
+        # Vary the delay based on question type and complexity.
+        with StageTimer(debug_log, "reading_delay"):
+            reading_time = self.calculate_reading_time(detected_type, elements, page_text)
+            debug_log.debug(
+                f"Reading delay: {reading_time:.1f}s (type={detected_type})",
+                extra={"stage": "Timing"},
+            )
+            time.sleep(reading_time)
+
         # --- Decision (heuristic or AI) ---
         self.guard.set_state(BotState.AI_DECISION)
         decision = None
@@ -1817,6 +2487,7 @@ class SurveyBot:
                     viewport=self.browser.get_viewport(),
                     page_title=page_title,
                     frame_info=self.browser.last_frame_info,
+                    detected_type=detected_type,
                 )
                 decision_source = "ai_cached_context"
             else:
@@ -1838,17 +2509,48 @@ class SurveyBot:
                     )
                     decision_source = "heuristic"
                 else:
-                    debug_log.debug(
-                        "No heuristic match, calling AI",
-                        extra={"stage": "Decide"},
-                    )
-                    decision = self.ai.decide(
-                        screenshot, elements, current_url, page_text,
-                        viewport=self.browser.get_viewport(),
-                        page_title=page_title,
-                        frame_info=self.browser.last_frame_info,
-                    )
-                    decision_source = "ai"
+                    # Try sniper mode for dropdowns with persona keywords
+                    # This handles cases where dropdown values differ from
+                    # persona text (e.g., "Mumbai" vs "01 - Mumbai / Maharashtra")
+                    sniper_action = None
+                    selects = [e for e in elements if e.get("tag") == "select"]
+                    if selects:
+                        # Extract persona keywords from page context
+                        # Look for location/demographic keywords in persona
+                        persona_keywords = self._extract_persona_keywords(page_text)
+                        for keyword in persona_keywords:
+                            sniper_action = self.ai.sniper_match_dropdown(
+                                keyword, elements, threshold=0.75
+                            )
+                            if sniper_action:
+                                debug_log.info(
+                                    f"SNIPER path: matched '{keyword}'",
+                                    extra={"stage": "Decide"},
+                                )
+                                break
+
+                    if sniper_action:
+                        decision = SurveyDecision(
+                            page_summary="sniper match",
+                            question_type="dropdown",
+                            confidence=0.9,
+                            actions=[sniper_action, Action(action_type="next", reasoning="proceed after sniper match")],
+                            memory_note="sniper dropdown match",
+                        )
+                        decision_source = "sniper"
+                    else:
+                        debug_log.debug(
+                            "No heuristic/sniper match, calling AI",
+                            extra={"stage": "Decide"},
+                        )
+                        decision = self.ai.decide(
+                            screenshot, elements, current_url, page_text,
+                            viewport=self.browser.get_viewport(),
+                            page_title=page_title,
+                            frame_info=self.browser.last_frame_info,
+                            detected_type=detected_type,
+                        )
+                        decision_source = "ai"
 
         # --- Decision result ---
         if not decision:
@@ -1889,6 +2591,32 @@ class SurveyBot:
                 "Completion detected by AI", extra={"stage": "Loop"}
             )
             return None
+
+        # --- Question type detection & enforcement ---
+        # Detect question type from elements and enforce constraints
+        # on the AI's actions (e.g., only one click for single-choice)
+        with StageTimer(debug_log, "enforce_question_type"):
+            detected_type = self.detect_question_type(elements)
+            # Use the more specific type: prefer detected over AI's guess
+            # when detected is not unknown (AI may misclassify)
+            effective_type = detected_type if detected_type != "unknown" else decision.question_type
+            if effective_type != decision.question_type:
+                debug_log.info(
+                    f"QUESTION TYPE MISMATCH: AI said {decision.question_type}, "
+                    f"detected {effective_type} — using detected type",
+                    extra={"stage": "Enforce"},
+                )
+            # Enforce type constraints on actions
+            original_action_count = len(decision.actions)
+            enforced_actions = self.enforce_question_type(decision.actions, effective_type)
+            if len(enforced_actions) != original_action_count:
+                debug_log.info(
+                    f"QUESTION TYPE ENFORCEMENT: filtered from "
+                    f"{original_action_count} to {len(enforced_actions)} actions "
+                    f"(type={effective_type})",
+                    extra={"stage": "Enforce"},
+                )
+            decision = decision.model_copy(update={"actions": enforced_actions, "question_type": effective_type})
 
         # --- Execute actions ---
         self.guard.set_state(BotState.ANSWER_ACTION)
@@ -1970,6 +2698,9 @@ class SurveyBot:
                         self.browser.scroll_random()
                         action_ok = True
                     elif act.action_type == "next":
+                        # Save cookies BEFORE navigation — if the bot crashes
+                        # during page transition, session state is preserved
+                        self.browser.save_session()
                         self.browser.click_next()
                         action_ok = True
                     elif act.action_type == "wait":
@@ -2201,4 +2932,9 @@ class SurveyBot:
         return False  # success → continue with timeout counter reset
 
     def stop(self):
+        # Save cookies before stopping — preserves session state if bot crashes
+        try:
+            self.browser.save_session()
+        except Exception:
+            pass
         self.browser.stop()
