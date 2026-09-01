@@ -349,7 +349,28 @@ async def decide(req: DecideRequest):
         if session_id not in MEMORY:
             MEMORY[session_id] = []
 
-    if len(req.screenshot_b64) > 4_000_000:
+    # ── Compress screenshot BEFORE size gate ───────────────────────
+    # Raw PNGs from extensions can exceed 4MB; compress first, then check.
+    screenshot_b64 = req.screenshot_b64
+    try:
+        img_data = base64.b64decode(req.screenshot_b64)
+        img = Image.open(io.BytesIO(img_data))
+        if img.width > 1280:
+            ratio = 1280 / img.width
+            img = img.resize((1280, int(img.height * ratio)), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=70)
+            screenshot_b64 = base64.b64encode(buf.getvalue()).decode()
+        else:
+            # Re-encode as JPEG to reduce size even if not resized
+            buf = io.BytesIO()
+            img = img.convert("RGB") if img.mode == "RGBA" else img
+            img.save(buf, format="JPEG", quality=70)
+            screenshot_b64 = base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        screenshot_b64 = req.screenshot_b64
+
+    if len(screenshot_b64) > 8_000_000:
         rec.update(path="error", error="screenshot too large",
                    latency_ms=int((time.time() - t0) * 1000))
         record_trace(rec)
@@ -374,20 +395,8 @@ async def decide(req: DecideRequest):
         return _heuristic_or_stop(rec, req, session_id, t0, cycle,
                                   reason=f"provider unavailable: {health['error']}")
 
-    # ── model path: build the image the model ACTUALLY sees ──────
-    screenshot_b64 = req.screenshot_b64
+    # ── model path: screenshot already compressed above ─────────────
     img_mime = "image/jpeg"
-    try:
-        img_data = base64.b64decode(req.screenshot_b64)
-        img = Image.open(io.BytesIO(img_data))
-        if img.width > 1280:
-            ratio = 1280 / img.width
-            img = img.resize((1280, int(img.height * ratio)), Image.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=70)
-            screenshot_b64 = base64.b64encode(buf.getvalue()).decode()
-    except Exception:
-        screenshot_b64 = req.screenshot_b64
 
     # ── sniper mode: for dense lists (>50 options), ask for keywords only ──
     # (The old trigger also matched three literal strings from
