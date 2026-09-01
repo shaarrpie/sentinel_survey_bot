@@ -2994,7 +2994,7 @@ class SurveyBot:
                 extra={"stage": "Summary"},
             )
 
-        return False  # success → continue with timeout counter reset
+        return True  # success → continue with timeout counter reset
 
     def stop(self):
         # Save cookies before stopping — preserves session state if bot crashes
