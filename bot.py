@@ -585,7 +585,7 @@ class SentinelSurveyBot:
                 
                 if "</think>" in raw_answer:
                     raw_answer = raw_answer.split("</think>")[-1].strip()
-                
+
                 return raw_answer
             except Exception as e:
                 wait = (2 ** attempt) + random.uniform(0, 1)
@@ -595,6 +595,118 @@ class SentinelSurveyBot:
                 else:
                     logger.error(f"[-] AI call failed after {max_retries} attempts: {e}")
                     return None
+
+    # ── Helper: strict label match (Fix 2) ───────────────────────────
+    def _opt_label_matches(self, label_lower: str, opt_text_lower: str) -> bool:
+        """Word-boundary / exact match for option text.
+
+        The old ``label_lower in opt_text_lower`` substring match fired
+        on any option that happened to contain the keyword as a
+        fragment (e.g. label "No" matched "Nothing"). Require a
+        word-boundary match or equality to avoid that.
+        """
+        if not label_lower or not opt_text_lower:
+            return False
+        if label_lower == opt_text_lower:
+            return True
+        if re.search(r"\b" + re.escape(label_lower) + r"\b", opt_text_lower):
+            return True
+        return False
+
+    # ── Helper: re-harvest options at execution time (Fix 3) ─────────
+    def _reharvest_options(self) -> list:
+        """Re-scan for visible option-like elements right before click.
+
+        The scan-phase snapshot can go stale between the AI scan and
+        the click (SPAs, ad re-renders, late-loading widgets).
+        """
+        sels = ("label, .survey-qualification-answer-multi, "
+                ".survey-qualification-answer-single, .answer-option, "
+                "button, input[type='radio'], input[type='checkbox']")
+        try:
+            elements = self.driver.find_elements(By.CSS_SELECTOR, sels)
+        except Exception:
+            return []
+        return [el for el in elements if el.is_displayed()]
+
+    # ── Helper: detect and fill a "Other (please specify)" field (Fix 9) ──
+    def _maybe_fill_other_specify(self, last_clicked_rect: dict) -> None:
+        """After clicking an option, check if a previously-hidden text
+        input appeared within 200px of the click. If so, fill it with
+        a generic plausible answer.
+        """
+        if not last_clicked_rect:
+            return
+        try:
+            lx = last_clicked_rect.get("x", 0) + last_clicked_rect.get("width", 0) / 2
+            ly = last_clicked_rect.get("y", 0) + last_clicked_rect.get("height", 0) / 2
+        except Exception:
+            return
+        try:
+            inputs = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                "input[type='text'], input:not([type]), textarea",
+            )
+        except Exception:
+            return
+        generic = "Prefer not to say"
+        for inp in inputs:
+            try:
+                if not inp.is_displayed():
+                    continue
+                # Skip already-filled
+                if (inp.get_attribute("value") or "").strip():
+                    continue
+                r = inp.rect
+                ix = r.get("x", 0) + r.get("width", 0) / 2
+                iy = r.get("y", 0) + r.get("height", 0) / 2
+                # Only consider inputs near the click (200px)
+                if ((ix - lx) ** 2 + (iy - ly) ** 2) ** 0.5 > 200:
+                    continue
+                # Heuristic: name/id/placeholder mentions "other" or "specify"
+                ctx = " ".join(filter(None, [
+                    inp.get_attribute("name") or "",
+                    inp.get_attribute("id") or "",
+                    inp.get_attribute("placeholder") or "",
+                ])).lower()
+                if "other" in ctx or "specify" in ctx or "please" in ctx:
+                    inp.clear()
+                    self.human_type(inp, generic)
+                    logger.info("    [+] Filled 'Other (please specify)' with generic answer")
+            except Exception:
+                logger.debug("swallowed exception in bot.py", exc_info=True)
+
+    # ── Helper: verify click state (Fix 4) ──────────────────────────
+    def _verify_click(self, element, expected_kind: str) -> bool:
+        """After clicking a radio/checkbox, confirm ``checked`` is set.
+        For buttons, just return True (URL/text change happens later).
+        """
+        if expected_kind not in ("radio", "checkbox"):
+            return True
+        try:
+            if element.tag_name.lower() == "input":
+                return element.get_attribute("checked") == "true" or element.is_selected()
+            # For <label>-wrapped inputs, also check the inner control
+            inner = element.find_element(By.CSS_SELECTOR, "input") if False else None
+            return element.is_selected() if hasattr(element, "is_selected") else True
+        except Exception:
+            return False
+
+    # ── Helper: set input value with input/change events (Fix 5) ────
+    def _set_input_value_with_events(self, element, value: str) -> None:
+        """For React/Vue/etc. that watch the value via the native input
+        event: set ``.value`` and dispatch ``input`` and ``change``.
+        Used for non-contenteditable inputs that need framework sync."""
+        self.driver.execute_script("""
+            const el = arguments[0];
+            const value = arguments[1];
+            const proto = Object.getPrototypeOf(el);
+            const setter = Object.getOwnPropertyDescriptor(proto, 'value')
+                && Object.getOwnPropertyDescriptor(proto, 'value').set;
+            if (setter) setter.call(el, value); else el.value = value;
+            el.dispatchEvent(new Event('input',  { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        """, element, value)
 
     def execute_type_action(self, label_keyword, value):
         try:
@@ -702,8 +814,11 @@ class SentinelSurveyBot:
                     coord_marker = ""
                 
                 opt_text = f"{opt_text} {coord_marker}".lower().strip()
-                
-                if opt_text and (label_lower in opt_text or (coord_marker and coord_marker.lower() in label_lower)):
+
+                # Fix 2: word-boundary / exact match instead of naive
+                # ``label_lower in opt_text_lower`` substring.
+                if opt_text and (self._opt_label_matches(label_lower, opt_text) or
+                                 (coord_marker and coord_marker.lower() in label_lower)):
                     self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", opt_el)
                     logger.info(f"    [📜 SCROLL] Option into view: {opt_el.text.strip()[:40]}")
                     try:
@@ -726,6 +841,25 @@ class SentinelSurveyBot:
                             except Exception:
                                 self.driver.execute_script(f"document.elementFromPoint({cx} - window.pageXOffset, {cy} - window.pageYOffset).click();")
                     logger.info(f"    [+] Clicked option at {coord_marker}")
+                    # Fix 4: verify the click actually toggled the
+                    # radio/checkbox state. If not, retry once via JS
+                    # .click() before giving up.
+                    kind = "radio" if (opt_el.tag_name.lower() == "input"
+                                       and (opt_el.get_attribute("type") or "").lower() == "radio") else (
+                          "checkbox" if (opt_el.tag_name.lower() == "input"
+                                         and (opt_el.get_attribute("type") or "").lower() == "checkbox") else "other")
+                    if kind in ("radio", "checkbox") and not self._verify_click(opt_el, kind):
+                        logger.warning("    [!] Click did not toggle state — retrying via JS .click()")
+                        try:
+                            self.driver.execute_script("arguments[0].click();", opt_el)
+                        except Exception:
+                            pass
+                    # Fix 9: if a new text field appeared near the click
+                    # (e.g. "Other (please specify)"), fill it.
+                    try:
+                        self._maybe_fill_other_specify(opt_el.rect)
+                    except Exception:
+                        pass
                     matched = True
                     break
             if not matched:
@@ -756,14 +890,32 @@ class SentinelSurveyBot:
                         logger.debug("swallowed exception in bot.py", exc_info=True)
                 
                 if cx is not None and cy is not None:
+                    # Fix 6: scroll-compensated click. The AI returns
+                    # page coordinates (X,Y) which may be outside the
+                    # current viewport. Scroll the point into view,
+                    # then re-derive a viewport-local position before
+                    # dispatching the click.
                     try:
-                        self.mouse.click(cx, cy)
-                        logger.info(f"    [+] Fallback: CDP clicked raw coordinates X:{cx}, Y:{cy}")
+                        self.driver.execute_script(
+                            "window.scrollTo(0, arguments[1] - window.innerHeight/2);",
+                            cx, cy,
+                        )
+                        time.sleep(0.15)
+                        vp_x, vp_y = self.driver.execute_script(
+                            "return [arguments[0] - window.pageXOffset, "
+                            "arguments[1] - window.pageYOffset];",
+                            cx, cy,
+                        )
+                    except Exception:
+                        vp_x, vp_y = cx, cy
+                    try:
+                        self.mouse.click(int(vp_x), int(vp_y))
+                        logger.info(f"    [+] Fallback: CDP clicked coords X:{int(vp_x)}, Y:{int(vp_y)} (page {cx},{cy})")
                         matched = True
                     except Exception:
                         try:
                             success = self.driver.execute_script(f"""
-                                var el = document.elementFromPoint({cx}, {cy});
+                                var el = document.elementFromPoint({int(vp_x)}, {int(vp_y)});
                                 if(el) {{
                                     el.click();
                                     return true;
@@ -771,12 +923,12 @@ class SentinelSurveyBot:
                                 return false;
                             """)
                             if success:
-                                logger.info(f"    [+] Fallback: Clicked raw coordinates X:{cx}, Y:{cy}")
+                                logger.info(f"    [+] Fallback: Clicked raw coordinates X:{int(vp_x)}, Y:{int(vp_y)}")
                                 matched = True
                             else:
-                                logger.error(f"    [-] Fallback failed: No element found at X:{cx}, Y:{cy}")
+                                logger.error(f"    [-] Fallback failed: No element found at X:{int(vp_x)}, Y:{int(vp_y)}")
                         except Exception as e:
-                            logger.error(f"    [-] Fallback JS error at X:{cx}, Y:{cy}: {e}")
+                            logger.error(f"    [-] Fallback JS error at X:{int(vp_x)}, Y:{int(vp_y)}: {e}")
 
             if not matched:
                 logger.warning(f"    [!] Click target not found in options: {label_keyword}")
@@ -795,6 +947,11 @@ class SentinelSurveyBot:
             execution_lines = [line.strip() for line in ans.split('\n') if line.strip()]
             
         try:
+            # Fix 3: the caller's options_elements may be stale (SPAs,
+            # ad re-renders). Re-harvest fresh, visible elements right
+            # before dispatch so the click hits a still-attached node.
+            if not options_elements:
+                options_elements = self._reharvest_options()
             for line in execution_lines:
                 line_lower = line.lower()
                 if line_lower.startswith("type:") and "->" in line:
@@ -804,10 +961,13 @@ class SentinelSurveyBot:
                     self.execute_type_action(label_keyword, val)
                 elif line_lower.startswith("click:"):
                     label_keyword = line.split(":", 1)[1].strip()
-                    self.execute_click_action(label_keyword, options_elements)
+                    # Fix 3: fresh re-harvest at click time
+                    fresh = self._reharvest_options()
+                    self.execute_click_action(label_keyword, fresh)
                 else:
                     if "[EXECUTION]" in ans and line.strip() and len(line) < 150 and not line.startswith("[") and not line.startswith("*"):
-                        self.execute_click_action(line.strip(), options_elements)
+                        fresh = self._reharvest_options()
+                        self.execute_click_action(line.strip(), fresh)
                             
             time.sleep(random.uniform(1.2, 2.5))
             # Attempt to click Next with i18n support
@@ -940,8 +1100,7 @@ class SentinelSurveyBot:
                         frame_src = scored[0][1].get_attribute("src") or "unknown"
                         logger.info(f"    [🖼️ FRAME SWITCH] Entering iframe: {frame_src[:80]}")
                         self.driver.switch_to.frame(scored[0][1])
-                    else:
-                        body = self.driver.find_element(By.TAG_NAME, "body")
+                    body = self.driver.find_element(By.TAG_NAME, "body")
 
                     current_url = self.driver.current_url
                     current_text = body.text.strip()
@@ -968,7 +1127,29 @@ class SentinelSurveyBot:
                                 with open(screenshot_name, "rb") as image_file:
                                     img_b64 = base64.b64encode(image_file.read()).decode('utf-8')
                                 
-                                vision_prompt = "I am stuck on this survey page. What do I need to click or type to proceed?\n\nCRITICAL: You MUST respond ONLY with an [EXECUTION] block. Do not provide analysis or reasoning. For coordinates, explicitly write X: <val>, Y: <val>.\n\nFormat:\n[EXECUTION]\nClick: X:..., Y:...\nType: <field> -> <value>"
+                                # Fix 8: better vision prompt with
+                                # persona, recent memory, and the
+                                # current question text so the model
+                                # has context for the choice.
+                                try:
+                                    persona_snippet = get_persona()[:500]
+                                except Exception:
+                                    persona_snippet = "(persona unavailable)"
+                                recent = "\n".join(self.memory_log[-3:]) if self.memory_log else "(no prior answers)"
+                                vision_prompt = (
+                                    "I am stuck on this survey page. "
+                                    "Based on my persona and recent answers, "
+                                    "decide what to click or type to proceed.\n\n"
+                                    f"PERSONA:\n{persona_snippet}\n\n"
+                                    f"RECENT ANSWERS:\n{recent}\n\n"
+                                    f"CURRENT QUESTION:\n{current_text[:300]}\n\n"
+                                    "Respond ONLY with an [EXECUTION] block. "
+                                    "For coordinates, explicitly write X: <val>, Y: <val>.\n\n"
+                                    "Format:\n"
+                                    "[EXECUTION]\n"
+                                    "Click: X:..., Y:...\n"
+                                    "Type: <field> -> <value>"
+                                )
                                 vision_resp = self.ai_client.chat.completions.create(
                                     model=self.model_name,
                                     messages=[
@@ -1075,8 +1256,9 @@ class SentinelSurveyBot:
                         
                         match_found = None
                         if keyword:
+                            kw = keyword.lower()
                             for opt in options_text_list:
-                                if keyword.lower() in opt.lower():
+                                if self._opt_label_matches(kw, opt.lower()):
                                     match_found = opt
                                     break
                         

@@ -260,12 +260,24 @@ class BrowserController:
             return png_bytes
 
     def get_element_map(self) -> List[dict]:
-        """Frame-aware element map: the top document plus every VISIBLE,
-        same-origin, depth-1 iframe (bounded to 15). Entries found inside an
-        iframe carry a ``frame`` index, and their coordinates are already
-        shifted by the iframe's offset so the whole map is expressed in
-        top-document viewport-absolute pixels — the same space click_coords()
-        and the AI's coordinate instructions use."""
+        """Frame-aware element map: the top document plus every VISIBLE
+        depth-1 iframe. There is NO arbitrary 15-frame cap — ProProfs-style
+        pages place the quiz iframe far down the DOM behind ad/tracking
+        frames, so a low cap silently skips the content frame (observed:
+        38 iframes on the target page, top-doc census useless, quiz inside
+        a frame). Entries found inside an iframe carry a ``frame`` index,
+        and their coordinates are already shifted by the iframe's offset so
+        the whole map is expressed in top-document viewport-absolute pixels
+        — the same space click_coords() and the AI's coordinate
+        instructions use.
+
+        WebDriver CAN switch into cross-origin iframes (same-origin policy
+        only restricts a page's own JS, not execute_script running inside
+        the frame itself) — so ad/tracking frames that load are scannable
+        too. Only genuinely unswitchable frames are excluded per-frame
+        below (pre-load about:blank, sandboxed without allow-scripts,
+        teardown races).
+        """
         elements: List[dict] = []
         self._element_frames = {}
         self._frame_offsets = {}
@@ -273,48 +285,65 @@ class BrowserController:
         try:
             # ── Top document ──────────────────────────────────────────────
             self._scan_current_frame(elements, None, (0, 0))
-            # ── Same-origin iframes (depth 1, bounded) ────────────────────
-            try:
-                frames = self.driver.find_elements(By.TAG_NAME, "iframe")
+            # ── All depth-1 iframes (no low cap; skip invisible) ──────────
+                # execute_script per frame.
+                frames_meta = self.driver.execute_script("""
+                    return Array.from(document.querySelectorAll('iframe')).map(
+                        function (f, i) {
+                            var r = f.getBoundingClientRect();
+                            return {index: i, src: f.src || '',
+                                    w: Math.round(r.width),
+                                    h: Math.round(r.height),
+                                    offx: Math.round(r.left),
+                                    offy: Math.round(r.top),
+                                    vis: r.width > 50 && r.height > 50};
+                        });
+                """)
             except Exception:
-                frames = []
-            for i in range(min(len(frames), 15)):
+                frames_meta = []
+            scanned_frames = 0
+            frames_with_elements = 0
+            for meta in frames_meta or []:
+                i = int(meta.get("index", -1))
+                if i < 0:
+                    continue
+                self.last_frame_info.append({
+                    "index": i,
+                    "src": str(meta.get("src") or "")[:200],
+                    "w": meta.get("w", 0),
+                    "h": meta.get("h", 0),
+                    "visible": bool(meta.get("vis")),
+                })
+                if not meta.get("vis"):
+                    continue
+                off = (int(meta.get("offx", 0)), int(meta.get("offy", 0)))
+                self._frame_offsets[i] = off
+                before = len(elements)
                 try:
-                    meta = self.driver.execute_script(
-                        "const f = document.querySelectorAll('iframe')[arguments[0]];"
-                        "if (!f) return null;"
-                        "const r = f.getBoundingClientRect();"
-                        "return {src: f.src || '', w: Math.round(r.width),"
-                        " h: Math.round(r.height), offx: Math.round(r.left),"
-                        " offy: Math.round(r.top),"
-                        " vis: r.width > 50 && r.height > 50};",
-                        i,
-                    )
-                    if not meta:
-                        continue
-                    self.last_frame_info.append({
-                        "index": i,
-                        "src": str(meta.get("src") or "")[:200],
-                        "w": meta.get("w", 0),
-                        "h": meta.get("h", 0),
-                        "visible": bool(meta.get("vis")),
-                    })
-                    if not meta.get("vis"):
-                        continue
-                    off = (int(meta.get("offx", 0)), int(meta.get("offy", 0)))
-                    self._frame_offsets[i] = off
                     self.driver.switch_to.frame(i)
                     try:
                         self._scan_current_frame(elements, i, off)
                     finally:
                         self.driver.switch_to.default_content()
+                    scanned_frames += 1
+                    if len(elements) > before:
+                        frames_with_elements += 1
                 except Exception as e:
-                    # Cross-origin frames raise on switch_to.frame() — expected.
+                    # Unswitchable frame — NOT a cross-origin failure (see
+                    # docstring). Pre-load / sandboxed / teardown races.
                     debug_log.debug(
                         f"iframe[{i}] not scannable ({e.__class__.__name__})",
                         extra={"stage": "Elements"},
                     )
                     self._reset_frame()
+            if scanned_frames:
+                debug_log.debug(
+                    f"Frames scanned={scanned_frames} "
+                    f"with-elements={frames_with_elements}",
+                    extra={"stage": "Elements"},
+                )
+            # Store for locator-descriptor re-acquisition at click time
+            self._last_elements = elements
             return elements
         except Exception as e:
             debug_log.warning(f"get_element_map failed: {e}", extra={"stage": "Elements"})
@@ -366,7 +395,9 @@ class BrowserController:
                         name: control.getAttribute('name') || '',
                         text: text,
                         x: Math.round(rect.left + rect.width / 2),
-                        y: Math.round(rect.top + rect.height / 2)
+                        y: Math.round(rect.top + rect.height / 2),
+                        w: Math.round(rect.width),
+                        h: Math.round(rect.height)
                     };
                     if (semanticType === 'radio' || semanticType === 'checkbox') {
                         entry.checked = 'checked' in control
@@ -491,30 +522,84 @@ class BrowserController:
             pass
 
     def click_element(self, element_id: int):
+        """Click an element by ID, re-acquiring it fresh at execution time.
+
+        Uses a 3-strategy fallback:
+          1. CSS selector by data-bot-id
+          2. XPath by associated label text
+          3. elementFromPoint at the stored coordinates
+        """
+        # Look up the descriptor from the last element map
+        descriptor = None
+        if hasattr(self, '_last_elements') and self._last_elements:
+            descriptor = next(
+                (e for e in self._last_elements if e.get("id") == element_id), None
+            )
+
         self._enter_active_frame(element_id)
         try:
+            # Strategy 1: CSS selector by data-bot-id
             sel = f"[data-bot-id='{element_id}']"
-            el = self.driver.find_element(By.CSS_SELECTOR, sel)
+            try:
+                el = self.driver.find_element(By.CSS_SELECTOR, sel)
+            except Exception:
+                el = None
+
+            # Strategy 2: XPath by text if we have a descriptor
+            if el is None and descriptor and descriptor.get("text"):
+                text_safe = descriptor["text"][:80].replace("'", "\\'")
+                try:
+                    el = self.driver.find_element(
+                        By.XPATH,
+                        f"//*[@data-bot-id='{element_id}' or contains(text(), '{text_safe}')]"
+                    )
+                except Exception:
+                    el = None
+
+            # Strategy 3: elementFromPoint at stored coordinates
+            if el is None and descriptor and descriptor.get("x") and descriptor.get("y"):
+                x, y = descriptor["x"], descriptor["y"]
+                el = self.driver.execute_script(
+                    "return document.elementFromPoint(arguments[0], arguments[1]);",
+                    x, y
+                )
+
+            if el is None:
+                debug_log.warning(
+                    f"CLICK_ELEMENT | element_id={element_id} not found by any strategy",
+                    extra={"stage": "Action"},
+                )
+                return False
+
             self.driver.execute_script(
                 "arguments[0].scrollIntoView({block:'center'});", el
             )
-            el.click()
+
+            # Click the label if the element is an input (bigger target)
+            tag = el.tag_name.lower() if hasattr(el, 'tag_name') else ''
+            if tag in ("input", "select"):
+                parent_label = self.driver.execute_script(
+                    "return arguments[0].closest('label');", el
+                )
+                if parent_label:
+                    el = parent_label
+
+            self.driver.execute_script("arguments[0].click();", el)
+            return True
         finally:
             self._reset_frame()
 
-    def click_coords(self, x: int, y: int):
+    def click_coords(self, x: int, y: int, element_w: int = None, element_h: int = None):
         """
-        Click at absolute VIEWPORT coordinates (x, y).
+        Click at absolute VIEWPORT coordinates (x, y) with human-like mouse.
 
-        The coordinates come from get_element_map()'s getBoundingClientRect()
-        centers — i.e. they are viewport-absolute, NOT element-relative.
+        If element_w/element_h are provided, jitter is relative to the
+        element size (not the viewport) — critical for small targets like
+        12×12px radio buttons where viewport-relative jitter of ±320px
+        would miss entirely.
 
-        We must use W3C origin="viewport" semantics (move_to_location), which
-        interprets (x, y) as viewport coordinates.  The previous code used
-        move_to_element_with_offset(body, x, y), which under W3C sums the body's
-        IN-VIEW CENTER point with (x, y) — a coordinate-system mismatch that
-        throws MoveTargetOutOfBoundsException for any target right of / below the
-        viewport center, and silently mis-clicks the rest.
+        Also adds realism: overshoot-and-correct (5% chance), Gaussian
+        tremor on the path, and 10% chance of a mid-movement pause.
         """
         # ── Geometry diagnostics (before any action) ──────────────────────
         geo = self.driver.execute_script(
@@ -541,17 +626,92 @@ class BrowserController:
             )
             return False
 
-        # ── Perform with viewport-origin semantics ───────────────────────
-        # Use an EXPLICIT ActionBuilder (the same construction ActionChains
-        # itself uses internally) — driver.w3c_actions is NOT present on
-        # this runtime's driver object and raised AttributeError in
-        # production ('Chrome' object has no attribute 'w3c_actions').
-        # move_to_location() emits pointerMove with origin="viewport",
-        # the exact semantics for viewport-absolute coordinates.
+        # ── Jitter: element-relative if we know the size, else minimal ──
+        if element_w and element_h:
+            jitter_x = random.uniform(-0.25, 0.25) * element_w
+            jitter_y = random.uniform(-0.25, 0.25) * element_h
+        else:
+            # Minimal jitter for coordinate-only clicks
+            jitter_x = random.uniform(-2, 2)
+            jitter_y = random.uniform(-2, 2)
+
+        target_x = max(0, min(vw - 1, x + int(jitter_x)))
+        target_y = max(0, min(vh - 1, y + int(jitter_y)))
+
+        # ── Human-like mouse path (overshoot + tremor + pause) ──────────────
+        self._human_mouse_to(target_x, target_y)
+
+        # ── Perform click ───────────────────────────────────────────────────
         builder = ActionBuilder(self.driver)
-        builder.pointer_action.move_to_location(x, y).click()
+        builder.pointer_action.move_to_location(target_x, target_y).click()
         builder.perform()
         return True
+
+    def _human_mouse_to(self, target_x: int, target_y: int):
+        """Move mouse to (target_x, target_y) with human-like behavior.
+
+        Implements: cubic bezier path, overshoot-and-correct (5% chance),
+        Gaussian tremor on every point, and 10% chance of a mid-path pause.
+        """
+        try:
+            # Get current mouse position via JS
+            current = self.driver.execute_script(
+                "return {x: window.mouseX || 0, y: window.mouseY || 0};"
+            )
+            # Fallback: start from viewport center
+            start_x = current.get("x", 0) or 0
+            start_y = current.get("y", 0) or 0
+            if not start_x and not start_y:
+                start_x, start_y = 100, 100
+        except Exception:
+            start_x, start_y = 100, 100
+
+        # 5% chance of overshooting the target and correcting
+        if random.random() < 0.05:
+            overshoot_x = target_x + random.randint(-30, 30)
+            overshoot_y = target_y + random.randint(-30, 30)
+        else:
+            overshoot_x, overshoot_y = target_x, target_y
+
+        # Build a cubic bezier path with tremor
+        mid_x = (start_x + overshoot_x) // 2 + random.randint(-10, 10)
+        mid_y = (start_y + overshoot_y) // 2 + random.randint(-10, 10)
+        control1_x = mid_x + random.randint(-15, 15)
+        control1_y = mid_y + random.randint(-15, 15)
+        control2_x = mid_x + random.randint(-15, 15)
+        control2_y = mid_y + random.randint(-15, 15)
+
+        steps = max(5, int(((target_x - start_x) ** 2 + (target_y - start_y) ** 2) ** 0.5) // 10)
+        steps = min(steps, 30)
+
+        builder = ActionBuilder(self.driver)
+        action = builder.pointer_action
+        for i in range(steps + 1):
+            t = i / steps
+            # Cubic bezier interpolation
+            cx = ((1 - t) ** 3 * start_x +
+                  3 * (1 - t) ** 2 * t * control1_x +
+                  3 * (1 - t) * t ** 2 * control2_x +
+                  t ** 3 * overshoot_x)
+            cy = ((1 - t) ** 3 * start_y +
+                  3 * (1 - t) ** 2 * t * control1_y +
+                  3 * (1 - t) * t ** 2 * control2_y +
+                  t ** 3 * overshoot_y)
+
+            # Gaussian tremor (sigma=1.5px)
+            cx += random.gauss(0, 1.5)
+            cy += random.gauss(0, 1.5)
+
+            action.move_to_location(int(cx), int(cy))
+
+            # 10% chance of a pause at a random intermediate point
+            if i > 0 and i < steps and random.random() < 0.10:
+                builder.perform()
+                time.sleep(random.uniform(0.2, 0.8))
+
+        # Final move to exact target
+        action.move_to_location(target_x, target_y)
+        builder.perform()
 
     def get_element_coords(self, element_id: int) -> Optional[tuple[int, int]]:
         """
@@ -581,16 +741,38 @@ class BrowserController:
         return (int(rect[0]), int(rect[1]))
 
     def type_into(self, element_id: int, text: str, human_like: bool = True):
+        """Type into an element bypassing React/Vue/Angular state updates.
+
+        Uses JS value assignment + explicit event dispatch instead of
+        send_keys(), which doesn't trigger onChange handlers on
+        framework-controlled inputs.
+        """
         sel = f"[data-bot-id='{element_id}']"
         el = self.driver.find_element(By.CSS_SELECTOR, sel)
         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        el.clear()
+
         if human_like:
+            # Type character-by-character with JS dispatch for realism + framework compat
             for ch in text:
-                el.send_keys(ch)
+                self.driver.execute_script(
+                    "arguments[0].value = arguments[0].value + arguments[1];"
+                    "['input','change'].forEach(function(evtName) {"
+                    "var evt = new Event(evtName, { bubbles: true });"
+                    "arguments[0].dispatchEvent(evt);"
+                    "});",
+                    el, ch,
+                )
                 time.sleep(random.randint(30, 120) / 1000)
         else:
-            el.send_keys(text)
+            # Fast path: set value + dispatch events in one script
+            self.driver.execute_script(
+                "arguments[0].value = arguments[1];"
+                "['input','change'].forEach(function(evtName) {"
+                "var evt = new Event(evtName, { bubbles: true });"
+                "arguments[0].dispatchEvent(evt);"
+                "});",
+                el, text,
+            )
 
     def scroll_random(self):
         self.driver.execute_script(f"window.scrollBy(0, {random.randint(200, 600)});")
