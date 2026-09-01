@@ -20,11 +20,16 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.actions.action_builder import ActionBuilder
 from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import (
     InvalidSessionIdException,
     NoSuchWindowException,
     WebDriverException,
+    MoveTargetOutOfBoundsException,
+    StaleElementReferenceException,
+    ElementClickInterceptedException,
+    NoSuchElementException,
 )
 from webdriver_guard import (
     SessionGuard, SessionDeadError, HealthStatus, BotState,
@@ -121,6 +126,34 @@ def _fallback_decision(log, reason: str) -> Optional[SurveyDecision]:
     )
 
 
+def _classify_click_failure(exc: Exception) -> str:
+    """Classify a Selenium exception during a click action.
+
+    Returns a short, stable classification string so that recovery logic
+    can decide whether a retry with fresh coordinates is worthwhile or
+    whether the defect is permanent (e.g. geometry error).
+    """
+    if isinstance(exc, MoveTargetOutOfBoundsException):
+        return "TARGET_OUTSIDE_VIEWPORT"
+    if isinstance(exc, StaleElementReferenceException):
+        return "TARGET_STALE"
+    if isinstance(exc, ElementClickInterceptedException):
+        return "TARGET_OBSCURED"
+    if isinstance(exc, NoSuchElementException):
+        return "TARGET_NOT_FOUND"
+    # Fallback: inspect the message text for known patterns
+    msg = str(exc).lower()
+    if "out of bounds" in msg:
+        return "TARGET_OUTSIDE_VIEWPORT"
+    if "stale" in msg:
+        return "TARGET_STALE"
+    if "intercepted" in msg:
+        return "TARGET_OBSCURED"
+    if "no such element" in msg:
+        return "TARGET_NOT_FOUND"
+    return "CLICK_FAILED"
+
+
 class BrowserController:
     def __init__(self, headless: bool = False, slow_mo: int = 50, profile_dir: str = "profiles/default"):
         self.headless = headless
@@ -129,6 +162,16 @@ class BrowserController:
         os.makedirs(self.profile_dir, exist_ok=True)
         self.driver = None
         self.disqualified = False
+        # element_id → iframe index (None = top document), filled by
+        # get_element_map(); used by _enter_active_frame() so element-backed
+        # clicks/typing land in the right browsing context.
+        self._element_frames: dict = {}
+        # iframe index → (offset_x, offset_y) of the iframe's top-left in
+        # top-document viewport coordinates (from the last element-map scan).
+        self._frame_offsets: dict = {}
+        # Metadata for the iframes seen during the last get_element_map()
+        # scan — surfaced to the AI prompt as context (src, size, visibility).
+        self.last_frame_info: list = []
 
     def start(self):
         options = uc.ChromeOptions()
@@ -217,8 +260,80 @@ class BrowserController:
             return png_bytes
 
     def get_element_map(self) -> List[dict]:
+        """Frame-aware element map: the top document plus every VISIBLE,
+        same-origin, depth-1 iframe (bounded to 15). Entries found inside an
+        iframe carry a ``frame`` index, and their coordinates are already
+        shifted by the iframe's offset so the whole map is expressed in
+        top-document viewport-absolute pixels — the same space click_coords()
+        and the AI's coordinate instructions use."""
+        elements: List[dict] = []
+        self._element_frames = {}
+        self._frame_offsets = {}
+        self.last_frame_info = []
         try:
-            result = self.driver.execute_script("""() => {
+            # ── Top document ──────────────────────────────────────────────
+            self._scan_current_frame(elements, None, (0, 0))
+            # ── Same-origin iframes (depth 1, bounded) ────────────────────
+            try:
+                frames = self.driver.find_elements(By.TAG_NAME, "iframe")
+            except Exception:
+                frames = []
+            for i in range(min(len(frames), 15)):
+                try:
+                    meta = self.driver.execute_script(
+                        "const f = document.querySelectorAll('iframe')[arguments[0]];"
+                        "if (!f) return null;"
+                        "const r = f.getBoundingClientRect();"
+                        "return {src: f.src || '', w: Math.round(r.width),"
+                        " h: Math.round(r.height), offx: Math.round(r.left),"
+                        " offy: Math.round(r.top),"
+                        " vis: r.width > 50 && r.height > 50};",
+                        i,
+                    )
+                    if not meta:
+                        continue
+                    self.last_frame_info.append({
+                        "index": i,
+                        "src": str(meta.get("src") or "")[:200],
+                        "w": meta.get("w", 0),
+                        "h": meta.get("h", 0),
+                        "visible": bool(meta.get("vis")),
+                    })
+                    if not meta.get("vis"):
+                        continue
+                    off = (int(meta.get("offx", 0)), int(meta.get("offy", 0)))
+                    self._frame_offsets[i] = off
+                    self.driver.switch_to.frame(i)
+                    try:
+                        self._scan_current_frame(elements, i, off)
+                    finally:
+                        self.driver.switch_to.default_content()
+                except Exception as e:
+                    # Cross-origin frames raise on switch_to.frame() — expected.
+                    debug_log.debug(
+                        f"iframe[{i}] not scannable ({e.__class__.__name__})",
+                        extra={"stage": "Elements"},
+                    )
+                    self._reset_frame()
+            return elements
+        except Exception as e:
+            debug_log.warning(f"get_element_map failed: {e}", extra={"stage": "Elements"})
+            self._reset_frame()
+            return elements
+
+    def _scan_current_frame(
+        self, elements: List[dict], frame_index: Optional[int], offset: tuple
+    ):
+        """Run the element-scanner JS in the CURRENT browsing context and
+        append the entries to ``elements`` with globally unique ids,
+        per-element frame bookkeeping, and coordinates shifted by ``offset``
+        into top-document viewport space."""
+        # Per-context id base keeps data-bot-id globally unique: the top
+        # document gets 0..999, iframe i gets (i+1)*1000... (bounded scans
+        # never approach 1000 entries per context).
+        start_id = 0 if frame_index is None else (frame_index + 1) * 1000
+        try:
+            result = self.driver.execute_script("""(startId) => {
                 const elements = [];
                 // Clear stale ids from the previous scan — on SPA-style surveys
                 // the DOM partially persists and [data-bot-id='7'] would match
@@ -239,11 +354,12 @@ class BrowserController:
                     const role = el.getAttribute('role') || '';
                     const semanticType = control.type ||
                         (role === 'radio' || role === 'checkbox' ? role : '');
-                    el.setAttribute('data-bot-id', idx);
+                    const botId = startId + idx;
+                    el.setAttribute('data-bot-id', botId);
                     const text = (el.innerText || el.getAttribute('aria-label') ||
                                  el.getAttribute('placeholder') || el.value || '').substring(0, 120);
                     const entry = {
-                        id: idx,
+                        id: botId,
                         tag: el.tagName.toLowerCase(),
                         type: semanticType,
                         role: role,
@@ -269,11 +385,25 @@ class BrowserController:
                     elements.push(entry);
                 });
                 return elements;
-            }""")
-            return result if result is not None else []
+            }""", start_id)
         except Exception as e:
-            debug_log.warning(f"get_element_map failed: {e}", extra={"stage": "Elements"})
-            return []
+            debug_log.warning(
+                f"element scan failed (frame={frame_index}): {e}",
+                extra={"stage": "Elements"},
+            )
+            return
+        # Fold this context's entries into the shared map: shift local
+        # coordinates by the iframe's offset so EVERY entry is expressed in
+        # top-document viewport pixels (the space click_coords uses), tag
+        # iframe entries with their frame index, and record the element →
+        # frame mapping for _enter_active_frame().
+        for entry in result or []:
+            entry["x"] = int(entry.get("x", 0)) + offset[0]
+            entry["y"] = int(entry.get("y", 0)) + offset[1]
+            if frame_index is not None:
+                entry["frame"] = frame_index
+                self._element_frames[entry["id"]] = frame_index
+            elements.append(entry)
 
     def get_page_text(self) -> str:
         return self.driver.find_element(By.TAG_NAME, "body").text
@@ -281,18 +411,133 @@ class BrowserController:
     def get_url(self) -> str:
         return self.driver.current_url
 
+    def get_viewport(self) -> tuple[int, int]:
+        """Live CSS-pixel viewport size (innerWidth x innerHeight)."""
+        try:
+            wh = self.driver.execute_script(
+                "return [window.innerWidth, window.innerHeight];"
+            )
+            return (int(wh[0]), int(wh[1]))
+        except Exception:
+            logger.debug("get_viewport failed", exc_info=True)
+            return (0, 0)
+
+    def _enter_active_frame(self, element_id: Optional[int] = None):
+        """Switch the driver into the browsing context that owns
+        ``element_id`` according to the last get_element_map() scan.
+        Always returns to the top document first, so calls compose safely
+        and a stale/unknown id silently acts on the top document."""
+        self._reset_frame()
+        if element_id is None:
+            return
+        frame_index = self._element_frames.get(element_id)
+        if frame_index is None:
+            return  # element lives in the top document
+        try:
+            self.driver.switch_to.frame(frame_index)
+        except Exception as e:
+            debug_log.warning(
+                f"frame enter failed for element_id={element_id} "
+                f"(frame={frame_index}): {e.__class__.__name__}",
+                extra={"stage": "Action"},
+            )
+
+    def _reset_frame(self):
+        """Return the driver to the top document (safe to call anytime)."""
+        try:
+            self.driver.switch_to.default_content()
+        except Exception:
+            pass
+
     def click_element(self, element_id: int):
-        sel = f"[data-bot-id='{element_id}']"
-        el = self.driver.find_element(By.CSS_SELECTOR, sel)
-        self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        el.click()
+        self._enter_active_frame(element_id)
+        try:
+            sel = f"[data-bot-id='{element_id}']"
+            el = self.driver.find_element(By.CSS_SELECTOR, sel)
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", el
+            )
+            el.click()
+        finally:
+            self._reset_frame()
 
     def click_coords(self, x: int, y: int):
-        # Absolute viewport click. move_by_offset() is relative to the
-        # CURRENT pointer position, so bare offset clicks drifted
-        # cumulatively on every fallback click.
-        body = self.driver.find_element(By.TAG_NAME, "body")
-        ActionChains(self.driver).move_to_element_with_offset(body, x, y).click().perform()
+        """
+        Click at absolute VIEWPORT coordinates (x, y).
+
+        The coordinates come from get_element_map()'s getBoundingClientRect()
+        centers — i.e. they are viewport-absolute, NOT element-relative.
+
+        We must use W3C origin="viewport" semantics (move_to_location), which
+        interprets (x, y) as viewport coordinates.  The previous code used
+        move_to_element_with_offset(body, x, y), which under W3C sums the body's
+        IN-VIEW CENTER point with (x, y) — a coordinate-system mismatch that
+        throws MoveTargetOutOfBoundsException for any target right of / below the
+        viewport center, and silently mis-clicks the rest.
+        """
+        # ── Geometry diagnostics (before any action) ──────────────────────
+        geo = self.driver.execute_script(
+            "return {vw: window.innerWidth, vh: window.innerHeight, "
+            "sx: window.scrollX, sy: window.scrollY, "
+            "dpr: window.devicePixelRatio, "
+            "doc_h: document.documentElement.scrollHeight, "
+            "frames: document.querySelectorAll('iframe').length};"
+        )
+        vw, vh = int(geo["vw"]), int(geo["vh"])
+        debug_log.debug(
+            f"ACTION START | type=click | interaction=coords | target=({x},{y}) | "
+            f"viewport={vw}x{vh} | scroll=({geo['sx']},{geo['sy']}) | "
+            f"dpr={geo['dpr']} | doc_h={geo['doc_h']} | iframes={geo['frames']}",
+            extra={"stage": "Action"},
+        )
+
+        # ── Bounds check (refuse invalid coords BEFORE W3C Perform Actions) ─
+        if not (0 <= x < vw and 0 <= y < vh):
+            debug_log.warning(
+                f"TARGET_OUTSIDE_VIEWPORT | coords=({x},{y}) viewport=({vw}x{vh}) — "
+                f"refusing invalid click",
+                extra={"stage": "Action"},
+            )
+            return False
+
+        # ── Perform with viewport-origin semantics ───────────────────────
+        # Use an EXPLICIT ActionBuilder (the same construction ActionChains
+        # itself uses internally) — driver.w3c_actions is NOT present on
+        # this runtime's driver object and raised AttributeError in
+        # production ('Chrome' object has no attribute 'w3c_actions').
+        # move_to_location() emits pointerMove with origin="viewport",
+        # the exact semantics for viewport-absolute coordinates.
+        builder = ActionBuilder(self.driver)
+        builder.pointer_action.move_to_location(x, y).click()
+        builder.perform()
+        return True
+
+    def get_element_coords(self, element_id: int) -> Optional[tuple[int, int]]:
+        """
+        Re-acquire a single element's CURRENT viewport-absolute center
+        via getBoundingClientRect (after scrollIntoView).
+
+        Used by the fallback/verify paths to avoid reusing stale
+        coordinates captured before scroll/click.
+        """
+        sel = f"[data-bot-id='{element_id}']"
+        try:
+            el = self.driver.find_element(By.CSS_SELECTOR, sel)
+        except NoSuchElementException:
+            debug_log.warning(
+                f"TARGET_NOT_FOUND | element_id={element_id} — element no longer in DOM",
+                extra={"stage": "Action"},
+            )
+            return None
+        self.driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});", el
+        )
+        rect = self.driver.execute_script(
+            "const r = arguments[0].getBoundingClientRect();"
+            "return [Math.round(r.left + r.width/2), Math.round(r.top + r.height/2)];",
+            el,
+        )
+        return (int(rect[0]), int(rect[1]))
 
     def type_into(self, element_id: int, text: str, human_like: bool = True):
         sel = f"[data-bot-id='{element_id}']"
@@ -526,19 +771,60 @@ class AIEngine:
                                    value=answer, reasoning=f"heuristic: {keyword}")]
         return None
 
-    def decide(self, screenshot_b64: str, elements: List[dict], url: str, page_text: str) -> Optional[SurveyDecision]:
+    def decide(
+        self,
+        screenshot_b64: str,
+        elements: List[dict],
+        url: str,
+        page_text: str,
+        viewport: Optional[tuple] = None,
+        page_title: str = "",
+        frame_info: Optional[List[dict]] = None,
+    ) -> Optional[SurveyDecision]:
         global _ai_consecutive_failures, _ai_first_failure_at, _last_failure_category
 
         memory_block = "\n".join(self.memory[-12:]) if self.memory else "None yet."
         rules_block = "\n".join(f"- {r}" for r in self.learned_rules) if self.learned_rules else "None yet."
 
-        prompt_text = f"""Analyze the survey screenshot and element map. Decide the next action(s).
+        # ── Change 3: truncation-aware budgets ────────────────────────────
+        # OUTPUT_TRUNCATED (finish_reason="length") means the output budget
+        # was exhausted mid-JSON. Retrying the IDENTICAL request truncates
+        # identically, so these budgets are mutable and the retry ALTERS
+        # the constraints instead (max_tokens x2, then halved elements).
+        current_max_tokens = 2500
+        element_budget = 40
+        truncation_adjustments = 0
+
+        # Viewport size for the coordinate-system instruction (0,0 when
+        # unknown — callers normally always pass the live viewport).
+        vw, vh = viewport if viewport else (0, 0)
+
+        # Iframe summary — the AI must know the survey may live inside a
+        # frame so it doesn't treat an empty top-document map as "no page".
+        if frame_info:
+            visible_frames = [f for f in frame_info if f.get("visible")]
+            frames_block = (
+                f"{len(frame_info)} iframe(s) on page, "
+                f"{len(visible_frames)} visible"
+                + "".join(
+                    f"\n  - frame[{f['index']}] {f.get('src', '')[:100]}"
+                    for f in visible_frames[:5]
+                )
+            )
+        else:
+            frames_block = "No iframes detected (all elements are in the top document)."
+
+        def _build_prompt(budget: int) -> str:
+            return f"""Analyze the survey screenshot and element map. Decide the next action(s).
 
 URL: {url}
+Title: {page_title[:150] or "(unknown)"}
+Viewport: {vw}x{vh} CSS pixels (click coordinates are in this space)
+Frames: {frames_block}
 Page text excerpt: {page_text[:2500]}
 
 Interactive elements (id, tag, type, text, center coordinates):
-{json.dumps(elements[:40], indent=2)}
+{json.dumps(elements[:budget], indent=2)}
 
 Memory of previous Q&A:
 {memory_block}
@@ -554,7 +840,15 @@ Instructions:
 - If the page seems to be a "Thank You" or completion screen, set question_type to "completion".
 - If stuck or confused, use "human_help".
 - Provide coordinates fallback for critical clicks.
+- Coordinates are CSS pixels relative to the viewport origin (top-left is
+  (0,0), bottom-right is ({vw},{vh})). The screenshot may be scaled by
+  devicePixelRatio — estimate positions relative to the viewport size, not
+  the image's pixel dimensions.
+- Only use element_id values that appear in the element map above; if the
+  map is empty, click by coordinates instead of inventing an id.
 - Keep memory_note to record what question was just answered for consistency."""
+
+        prompt_text = _build_prompt(element_budget)
 
         debug_log.debug(
             f"DECIDE call: elements={len(elements)} url={url[:80]}",
@@ -576,9 +870,18 @@ Instructions:
                             ]}
                         ],
                         response_format=SurveyDecision,
-                        max_tokens=2500,
+                        max_tokens=current_max_tokens,
                         temperature=0.2,
                         timeout=AI_REQUEST_TIMEOUT,
+                    )
+                usage = getattr(resp, "usage", None)
+                if usage is not None:
+                    debug_log.info(
+                        f"AI USAGE | completion={getattr(usage, 'completion_tokens', '?')} "
+                        f"prompt={getattr(usage, 'prompt_tokens', '?')} "
+                        f"total={getattr(usage, 'total_tokens', '?')} "
+                        f"(unaccounted = reasoning/thinking tokens)",
+                        extra={"stage": "AI"},
                     )
                 decision = resp.choices[0].message.parsed
                 if decision is not None:
@@ -604,6 +907,36 @@ Instructions:
                         extra={"stage": "AI"},
                     )
                     return _fallback_decision(debug_log, "connection_down")
+                if category == "OUTPUT_TRUNCATED":
+                    # Identical requests truncate identically — ALTER the
+                    # request instead of repeating it (report §24 Change 3).
+                    if truncation_adjustments == 0:
+                        truncation_adjustments += 1
+                        current_max_tokens *= 2
+                        prompt_text = _build_prompt(element_budget)
+                        debug_log.warning(
+                            f"OUTPUT TRUNCATED | adjusted retry 1/2: "
+                            f"max_tokens={current_max_tokens}",
+                            extra={"stage": "AI"},
+                        )
+                        continue
+                    if truncation_adjustments == 1:
+                        truncation_adjustments += 1
+                        current_max_tokens *= 2
+                        element_budget = 20
+                        prompt_text = _build_prompt(element_budget)
+                        debug_log.warning(
+                            f"OUTPUT TRUNCATED | adjusted retry 2/2: "
+                            f"max_tokens={current_max_tokens} "
+                            f"element_budget={element_budget}",
+                            extra={"stage": "AI"},
+                        )
+                        continue
+                    debug_log.error(
+                        "OUTPUT TRUNCATED after 2 adjusted retries — using fallback",
+                        extra={"stage": "AI"},
+                    )
+                    return _fallback_decision(debug_log, "output_truncated")
                 if attempt < AI_MAX_RETRIES and _retryable(category):
                     delay = min(2 ** attempt, 8)
                     debug_log.warning(
@@ -629,9 +962,18 @@ Instructions:
                                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}}
                             ]}
                         ],
-                        max_tokens=2500,
+                        max_tokens=current_max_tokens,
                         temperature=0.2,
                         timeout=AI_REQUEST_TIMEOUT,
+                    )
+                usage = getattr(resp, "usage", None)
+                if usage is not None:
+                    debug_log.info(
+                        f"AI USAGE | completion={getattr(usage, 'completion_tokens', '?')} "
+                        f"prompt={getattr(usage, 'prompt_tokens', '?')} "
+                        f"total={getattr(usage, 'total_tokens', '?')} "
+                        f"(unaccounted = reasoning/thinking tokens)",
+                        extra={"stage": "AI"},
                     )
                 raw = resp.choices[0].message.content.strip()
                 if "```json" in raw:
@@ -658,6 +1000,37 @@ Instructions:
                         extra={"stage": "AI"},
                     )
                     return _fallback_decision(debug_log, "connection_down")
+                if category == "OUTPUT_TRUNCATED":
+                    # Identical requests truncate identically — ALTER the
+                    # request instead of repeating it (report §24 Change 3).
+                    # Budgets/adjustments persist from the structured loop.
+                    if truncation_adjustments == 0:
+                        truncation_adjustments += 1
+                        current_max_tokens *= 2
+                        prompt_text = _build_prompt(element_budget)
+                        debug_log.warning(
+                            f"OUTPUT TRUNCATED | adjusted retry 1/2: "
+                            f"max_tokens={current_max_tokens}",
+                            extra={"stage": "AI"},
+                        )
+                        continue
+                    if truncation_adjustments == 1:
+                        truncation_adjustments += 1
+                        current_max_tokens *= 2
+                        element_budget = 20
+                        prompt_text = _build_prompt(element_budget)
+                        debug_log.warning(
+                            f"OUTPUT TRUNCATED | adjusted retry 2/2: "
+                            f"max_tokens={current_max_tokens} "
+                            f"element_budget={element_budget}",
+                            extra={"stage": "AI"},
+                        )
+                        continue
+                    debug_log.error(
+                        "OUTPUT TRUNCATED after 2 adjusted retries — using fallback",
+                        extra={"stage": "AI"},
+                    )
+                    return _fallback_decision(debug_log, "output_truncated")
                 if attempt < AI_MAX_RETRIES and _retryable(category):
                     delay = min(2 ** attempt, 8)
                     debug_log.warning(
@@ -758,6 +1131,30 @@ class SurveyBot:
         url = self.browser.get_url()
         return hashlib.md5(f"{url}::{text}".encode()).hexdigest()
 
+    @staticmethod
+    def _nearest_element(
+        elements: list, target_x: int, target_y: int
+    ) -> Optional[dict]:
+        """Find the nearest element in the map to (target_x, target_y).
+
+        Used by the coordinate-only recovery path (when element_id is None)
+        to re-project stale stale coordinates onto a fresh element read.
+        """
+        if not elements:
+            return None
+        best = None
+        best_dist = float("inf")
+        for el in elements:
+            ex = el.get("x")
+            ey = el.get("y")
+            if ex is None or ey is None:
+                continue
+            dist = (ex - target_x) ** 2 + (ey - target_y) ** 2
+            if dist < best_dist:
+                best_dist = dist
+                best = el
+        return best
+
     def _visual_fingerprint(self) -> Optional[str]:
         try:
             import imagehash
@@ -829,7 +1226,7 @@ class SurveyBot:
         time.sleep(0.8)
         post_fingerprint = self._page_fingerprint()
         if post_fingerprint == pre_fingerprint:
-            print("[!] Action had no effect — retrying with coordinates")
+            print("[!] Action had no effect")
             return False
         return True
 
@@ -1181,7 +1578,10 @@ class SurveyBot:
         with StageTimer(debug_log, "decide", threshold=5.0):
             if cached:
                 decision = self.ai.decide(
-                    screenshot, elements, current_url, page_text
+                    screenshot, elements, current_url, page_text,
+                    viewport=self.browser.get_viewport(),
+                    page_title=page_title,
+                    frame_info=self.browser.last_frame_info,
                 )
                 decision_source = "ai_cached_context"
             else:
@@ -1208,7 +1608,10 @@ class SurveyBot:
                         extra={"stage": "Decide"},
                     )
                     decision = self.ai.decide(
-                        screenshot, elements, current_url, page_text
+                        screenshot, elements, current_url, page_text,
+                        viewport=self.browser.get_viewport(),
+                        page_title=page_title,
+                        frame_info=self.browser.last_frame_info,
                     )
                     decision_source = "ai"
 
@@ -1266,6 +1669,20 @@ class SurveyBot:
                     f"reasoning={act.reasoning[:80]}",
                     extra={"stage": "Action"},
                 )
+                # Guard against hallucinated element_ids: the AI only sees the
+                # element map captured this iteration, so any id outside it
+                # cannot exist in the DOM (typical when the map is empty
+                # because the quiz lives inside an iframe).
+                if act.element_id is not None:
+                    known_ids = {el.get("id") for el in elements}
+                    if act.element_id not in known_ids:
+                        debug_log.warning(
+                            f"HALLUCINATED_ID | element_id={act.element_id} not "
+                            f"in element map ({len(known_ids)} elements) — "
+                            f"dropping to coords={act.coordinates}",
+                            extra={"stage": "Action"},
+                        )
+                        act = act.model_copy(update={"element_id": None})
                 pre_fp = self._page_fingerprint()
                 action_ok = False
                 try:
@@ -1274,8 +1691,12 @@ class SurveyBot:
                             self.browser.click_element(act.element_id)
                             action_ok = True
                         elif act.coordinates:
-                            self.browser.click_coords(*act.coordinates)
-                            action_ok = True
+                            action_ok = self.browser.click_coords(*act.coordinates)
+                        else:
+                            debug_log.error(
+                                "ACTION: click has neither element_id nor coordinates",
+                                extra={"stage": "Action"},
+                            )
                     elif act.action_type == "type":
                         if act.element_id is not None and act.value:
                             self.browser.type_into(
@@ -1321,24 +1742,136 @@ class SurveyBot:
                     )
 
                 except Exception as e:
+                    classification = _classify_click_failure(e)
                     debug_log.error(
-                        f"ACTION FAILED: type={act.action_type} error={e}",
+                        f"ACTION FAILED: type={act.action_type} error={e} | "
+                        f"classification={classification} | "
+                        f"element_id={act.element_id} coords={act.coordinates}",
                         extra={"stage": "Action"},
                         exc_info=True,
                     )
                     action_ok = False
-                    if act.coordinates and act.action_type in ("click", "type"):
-                        try:
-                            self.browser.click_coords(*act.coordinates)
-                            debug_log.debug(
-                                "Fallback coordinate click succeeded",
+                    # ── Bounded, classified recovery (ONE re-acquisition,
+                    #     never an identical repeat with stale coordinates) ──
+                    if classification == "TARGET_OUTSIDE_VIEWPORT":
+                        debug_log.warning(
+                            "RECOVERY SKIPPED | geometry error is permanent "
+                            "for these coordinates — not retrying",
+                            extra={"stage": "Action"},
+                        )
+                    elif (
+                        act.element_id is not None
+                        and act.action_type == "click"
+                    ):
+                        # Re-acquire the element's LIVE center (after scroll)
+                        # and click_coords with fresh, in-bounds coordinates.
+                        live = self.browser.get_element_coords(act.element_id)
+                        if live is not None:
+                            try:
+                                if self.browser.click_coords(*live):
+                                    debug_log.debug(
+                                        "RECOVERY attempt=1/1 | "
+                                        "strategy=re-acquire-by-element_id | "
+                                        f"element_id={act.element_id} | "
+                                        "result=CLICK_SUCCESS | "
+                                        f"live_coords={live}",
+                                        extra={"stage": "Action"},
+                                    )
+                                    action_ok = True
+                                else:
+                                    debug_log.warning(
+                                        "RECOVERY attempt=1/1 | "
+                                        "strategy=re-project | "
+                                        "result=CLICK_REFUSED | "
+                                        f"coords={live}",
+                                        extra={"stage": "Action"},
+                                    )
+                            except Exception as e2:
+                                debug_log.error(
+                                    "RECOVERY attempt=1/1 | "
+                                    "strategy=re-acquire-by-element_id | "
+                                    "result=CLICK_FAILED | "
+                                    f"error={e2}",
+                                    extra={"stage": "Action"},
+                                    exc_info=True,
+                                )
+                        elif act.coordinates:
+                            # Element is gone (stale id / re-rendered DOM /
+                            # iframe content) — fall back ONCE to the
+                            # AI-provided viewport coordinates. click_coords
+                            # bounds-checks them, so an out-of-viewport guess
+                            # is refused instead of throwing.
+                            try:
+                                if self.browser.click_coords(*act.coordinates):
+                                    debug_log.warning(
+                                        "RECOVERY attempt=1/1 | "
+                                        "strategy=ai-coordinates | "
+                                        f"element_id={act.element_id} not in "
+                                        f"DOM — clicked coords={act.coordinates}",
+                                        extra={"stage": "Action"},
+                                    )
+                                    action_ok = True
+                                else:
+                                    debug_log.warning(
+                                        "RECOVERY: ai-coordinates "
+                                        f"{act.coordinates} outside viewport "
+                                        "— refusing",
+                                        extra={"stage": "Action"},
+                                    )
+                            except Exception as e2:
+                                debug_log.error(
+                                    "RECOVERY attempt=1/1 | "
+                                    "strategy=ai-coordinates | "
+                                    f"result=CLICK_FAILED | error={e2}",
+                                    extra={"stage": "Action"},
+                                    exc_info=True,
+                                )
+                        else:
+                            debug_log.warning(
+                                f"RECOVERY: element_id={act.element_id} "
+                                "not found and no fallback coordinates",
                                 extra={"stage": "Action"},
                             )
-                        except Exception as e2:
-                            debug_log.error(
-                                f"Fallback click also failed: {e2}",
+                    elif act.coordinates and act.action_type == "click":
+                        # No element_id — cannot re-identify the target.
+                        # One bounded attempt: re-read a fresh element map
+                        # and find the nearest interactive element.
+                        fresh_map = self.browser.get_element_map()
+                        nearest = self._nearest_element(
+                            fresh_map, *act.coordinates
+                        )
+                        if nearest is not None:
+                            try:
+                                if self.browser.click_coords(
+                                    nearest["x"], nearest["y"]
+                                ):
+                                    debug_log.debug(
+                                        "RECOVERY attempt=1/1 | "
+                                        "strategy=nearest-element | "
+                                        "result=CLICK_SUCCESS | "
+                                        f"reprojected={nearest['x']},{nearest['y']}",
+                                        extra={"stage": "Action"},
+                                    )
+                                    action_ok = True
+                                else:
+                                    debug_log.warning(
+                                        "RECOVERY: nearest element coords "
+                                        "also outside viewport",
+                                        extra={"stage": "Action"},
+                                    )
+                            except Exception as e2:
+                                debug_log.error(
+                                    "RECOVERY attempt=1/1 | "
+                                    "strategy=nearest-element | "
+                                    f"result=CLICK_FAILED | error={e2}",
+                                    extra={"stage": "Action"},
+                                    exc_info=True,
+                                )
+                        else:
+                            debug_log.warning(
+                                "RECOVERY: no element_id and no fresh "
+                                "element near target coords — cannot re-project",
                                 extra={"stage": "Action"},
-                                exc_info=True,
                             )
 
                 # Verify action had effect
@@ -1349,15 +1882,15 @@ class SurveyBot:
                                 f"Action {act.action_type} had no effect",
                                 extra={"stage": "Verify"},
                             )
-                            if act.coordinates and act.action_type == "click":
-                                try:
-                                    self.browser.click_coords(*act.coordinates)
-                                except Exception as e:
-                                    debug_log.error(
-                                        f"Verify fallback failed: {e}",
-                                        extra={"stage": "Verify"},
-                                        exc_info=True,
-                                    )
+                            debug_log.error(
+                                f"VERIFICATION FAILED | type={act.action_type} | "
+                                f"element_id={act.element_id} | "
+                                f"coords={act.coordinates}",
+                                extra={"stage": "Verify"},
+                            )
+                            # NO third identical click — stop touching this
+                            # action.  The existing stuck detector and
+                            # human_help escalation handle long-term recovery.
 
                 action_results.append(action_ok)
 

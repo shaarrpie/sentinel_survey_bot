@@ -73,6 +73,36 @@ def classify_failure(exc):
     if openai is not None and isinstance(exc, openai.BadRequestError):
         return "MALFORMED_REQUEST", redact(str(exc))[:200]
 
+    # Output truncation (finish_reason == "length"): the HTTP request
+    # SUCCEEDED and the SDK raised client-side during structured-output
+    # parsing. This is NOT a connection failure — it means the output
+    # budget was exhausted before the JSON schema completed. Carrying
+    # the usage numbers here makes the budget-vs-thinking-token math
+    # visible in the log (see forensic report §15).
+    try:
+        from openai import LengthFinishReasonError  # type: ignore
+
+        if isinstance(exc, LengthFinishReasonError):
+            usage = getattr(getattr(exc, "completion", None), "usage", None)
+            if usage is not None:
+                detail = (
+                    "finish_reason=length; output budget exhausted before "
+                    f"schema completed | completion_tokens="
+                    f"{getattr(usage, 'completion_tokens', '?')} | "
+                    f"prompt_tokens={getattr(usage, 'prompt_tokens', '?')} | "
+                    f"total_tokens={getattr(usage, 'total_tokens', '?')} | "
+                    "unaccounted = total - prompt - completion "
+                    "(reasoning/thinking tokens)"
+                )
+            else:
+                detail = (
+                    "finish_reason=length; output budget exhausted before "
+                    "schema completed (usage unavailable)"
+                )
+            return "OUTPUT_TRUNCATED", detail
+    except ImportError:
+        pass
+
     # Walk the chain for transport errors
     for e in chain:
         if isinstance(e, socket.gaierror):
@@ -113,7 +143,7 @@ def log_request_failure(log, exc, attempt, started):
     """Log the full classified failure with traceback."""
     category, detail = classify_failure(exc)
     log.error(
-        "Connection failure | Category: %s | Exception type: %s | "
+        "AI REQUEST FAILURE | Category: %s | Exception type: %s | "
         "Detail: %s | Target: %s | Elapsed: %.2f s | Attempt: %d/%d | "
         "Traceback:\n%s",
         category,
@@ -129,7 +159,7 @@ def log_request_failure(log, exc, attempt, started):
 
 
 def _retryable(category):
-    """Auth/config/parse errors cannot be fixed by retrying."""
+    """Auth/config/parse/truncation errors cannot be fixed by retrying."""
     return category not in {
         "HTTP_401_UNAUTHORIZED",
         "HTTP_403_FORBIDDEN",
@@ -137,6 +167,10 @@ def _retryable(category):
         "MALFORMED_REQUEST",
         "RESPONSE_PARSE_ERROR",
         "SDK_CONFIG",
+        # Retrying the IDENTICAL request truncates identically — the
+        # retry must ALTER constraints (max_tokens / element budget).
+        # decide() handles this specially (Change 3).
+        "OUTPUT_TRUNCATED",
     }
 
 

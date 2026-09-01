@@ -6,7 +6,11 @@ from dotenv import load_dotenv
 from core import SurveyBot
 
 
-load_dotenv()
+# override=True: VS Code's env-file injection bakes .env values into the
+# terminal at creation time; without override, a stale terminal (created
+# before .env was edited, e.g. the Gemini->Mistral switch) keeps the OLD
+# provider config forever. .env is the source of truth — it wins.
+load_dotenv(override=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
