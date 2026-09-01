@@ -6,6 +6,7 @@ import base64
 import json
 import logging
 import datetime
+from datetime import timedelta
 import socket
 import shutil
 import re
@@ -273,6 +274,38 @@ class SentinelSurveyBot:
         self.memory_log = []
         self.is_paused = False
         self.gui_shutdown = False
+
+        # ── Session statistics tracking ──
+        self.session_stats = {
+            "start_time": time.time(),
+            "pages_seen": 0,
+            "actions_taken": 0,
+            "status": "running",
+            "url": None,
+        }
+        self.rules_added_this_session = 0
+        self.speed_delay = 1.0  # multiplier for too-fast retries
+        self.too_fast_retries = 0  # consecutive too-fast hits
+        self.TOO_FAST_MAX_RETRIES = 3  # bounded retry limit
+
+        # ── Too-fast detection patterns ──
+        self.TOO_FAST_PATTERNS = [
+            # URL fragments
+            "too-fast", "speed", "speeding", "timeout",
+            # Body text (case-insensitive)
+            "answered too quickly", "too fast", "speed check",
+            "please slow down", "you are moving too fast",
+            # Common element selectors
+            "[class*='too-fast']", "[class*='speed-check']",
+            "[id*='tooFast']", "[id*='speedCheck']",
+        ]
+
+        # ── Completion detection patterns ──
+        self.COMPLETION_PATTERNS = [
+            "thank you", "completed", "reward", "finished",
+            "success", "your responses have been recorded",
+            "congratulations", "submission successful",
+        ]
         
         logger.info(f"[*] Loading Cookie Vault for Profile: {profile_name}...")
         self.profile_mgr = ProfileManager()
@@ -1153,6 +1186,9 @@ class SentinelSurveyBot:
     def execute_autonomous_action(self, ans, options_elements):
         if not ans: return
         logger.info("[*] Attempting autonomous DOM injection...")
+
+        # Track action for session stats
+        self.session_stats["actions_taken"] += 1
         
         execution_lines = []
         if "[EXECUTION]" in ans:
@@ -1223,8 +1259,240 @@ class SentinelSurveyBot:
                     logger.info("    [+] Autonomously clicked Next page.")
             except Exception as next_err:
                 logger.debug(f"    [!] Could not click Next button: {next_err}")
+
+            # ── Final page detection: no Next button but Submit exists ──
+            # If we didn't find a Next button, check for a Submit button
+            # indicating we're on the final page of the survey.
+            if not next_btn:
+                try:
+                    submit_selectors = [
+                        "input[type='submit']", "button[type='submit']",
+                        "[id*='submit' i]", "[class*='submit' i]",
+                    ]
+                    has_submit = False
+                    for sel in submit_selectors:
+                        els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                        if [el for el in els if el.is_displayed()]:
+                            has_submit = True
+                            break
+                    if has_submit:
+                        logger.info("[*] Final page detected (Submit button, no Next). Calling submit_survey()...")
+                        self.submit_survey()
+                except Exception as submit_check_err:
+                    logger.debug(f"    [!] Final page check failed: {submit_check_err}")
         except Exception as e:
             logger.error(f"    [-] Autonomous DOM injection failed: {e}")
+
+    def check_if_too_fast(self) -> bool:
+        """Detect if the survey rejected a submission for being too fast.
+
+        Checks URL fragments, body text, and common element selectors
+        against known too-fast patterns. Returns True if detected.
+
+        Returns:
+            True if too-fast message detected, False otherwise
+        """
+        try:
+            time.sleep(1.5)  # Wait for page to settle
+
+            # Check 1: URL fragments
+            current_url = self.driver.current_url.lower()
+            for pattern in self.TOO_FAST_PATTERNS:
+                if len(pattern) < 15 and pattern in current_url:  # URL fragments are short
+                    logger.warning(f"[⚠️ TOO-FAST DETECTED] URL pattern hit: '{pattern}' in {current_url}")
+                    return True
+
+            # Check 2: Body text (case-insensitive)
+            try:
+                body_text = self.driver.find_element(By.TAG_NAME, "body").text.lower()
+                text_patterns = [
+                    "answered too quickly", "too fast", "speed check",
+                    "please slow down", "you are moving too fast",
+                    "you moved too quickly", "too quick", "slow down",
+                ]
+                for pattern in text_patterns:
+                    if pattern in body_text:
+                        logger.warning(f"[⚠️ TOO-FAST DETECTED] Body text pattern hit: '{pattern}'")
+                        return True
+            except Exception:
+                pass  # Body not available, continue to element check
+
+            # Check 3: Element selectors
+            element_selectors = [
+                "[class*='too-fast']", "[class*='speed-check']",
+                "[id*='tooFast']", "[id*='speedCheck']",
+                "[class*='error']", "[class*='warning']",
+            ]
+            for selector in element_selectors:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    visible = [el for el in elements if el.is_displayed()]
+                    if visible:
+                        logger.warning(f"[⚠️ TOO-FAST DETECTED] Element found: {selector} ({len(visible)} visible)")
+                        return True
+                except Exception:
+                    continue
+
+            return False
+
+        except Exception as e:
+            logger.debug(f"check_if_too_fast check failed: {e}")
+            return False
+
+    def submit_survey(self) -> bool:
+        """Submit the final survey page with verification.
+
+        Clicks the final submit button, checks for too-fast messages,
+        and verifies completion. Returns True only if submission succeeded.
+
+        Returns:
+            True if survey was successfully submitted and completed
+        """
+        logger.info("[*] Attempting final survey submission...")
+
+        # 1. Find and click the final submit button
+        final_selectors = [
+            "input[type='submit']", "button[type='submit']",
+            "[id*='submit' i]", "[class*='submit' i]",
+            "button[id*='finish' i]", "button[class*='finish' i]",
+        ]
+
+        submit_btn = None
+        for selector in final_selectors:
+            try:
+                elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                visible = [el for el in elements if el.is_displayed() and el.is_enabled()]
+                if visible:
+                    submit_btn = visible[0]
+                    logger.info(f"[📤 SUBMIT] Found submit button: {selector}")
+                    break
+            except Exception:
+                continue
+
+        if not submit_btn:
+            # Fallback: look for any button with submit-like text
+            try:
+                buttons = self.driver.find_elements(By.CSS_SELECTOR, "button")
+                for btn in buttons:
+                    btn_text = (btn.text or btn.get_attribute("value") or "").lower()
+                    if any(kw in btn_text for kw in ["submit", "finish", "complete", "send"]):
+                        if btn.is_displayed() and btn.is_enabled():
+                            submit_btn = btn
+                            logger.info(f"[📤 SUBMIT] Found submit button by text: '{btn_text}'")
+                            break
+            except Exception:
+                pass
+
+        if not submit_btn:
+            logger.error("[📤 SUBMIT] No submit button found")
+            return False
+
+        # 2. Click the submit button
+        try:
+            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", submit_btn)
+            rect = submit_btn.rect
+            cx = int(rect['x'] + rect['width'] / 2)
+            cy = int(rect['y'] + rect['height'] / 2)
+            clicked = self.mouse.click(cx, cy, int(rect['width']), int(rect['height']))
+            if not clicked:
+                self.human_mouse_move(submit_btn)
+                self.actions.move_to_element(submit_btn).click().perform()
+            logger.info("[📤 SUBMIT] Clicked submit button")
+        except Exception as e:
+            logger.error(f"[📤 SUBMIT] Failed to click submit: {e}")
+            # Fallback to JS click
+            try:
+                self.driver.execute_script("arguments[0].click();", submit_btn)
+            except Exception as e2:
+                logger.error(f"[📤 SUBMIT] JS click also failed: {e2}")
+                return False
+
+        # 3. Check for too-fast message
+        if self.check_if_too_fast():
+            self.too_fast_retries += 1
+            self.speed_delay *= 1.5
+            logger.warning(
+                f"[📤 SUBMIT] Too-fast detected (retry {self.too_fast_retries}/{self.TOO_FAST_MAX_RETRIES}). "
+                f"Next delay multiplier: {self.speed_delay:.1f}x"
+            )
+            if self.too_fast_retries >= self.TOO_FAST_MAX_RETRIES:
+                logger.error("[📤 SUBMIT] Max too-fast retries reached — stopping to prevent infinite loop")
+                self._finalize_session(status="too_fast")
+                return False
+            return False  # Signal retry needed
+
+        # 4. Check for completion indicators
+        try:
+            time.sleep(2.0)  # Wait for completion page
+            body_text = self.driver.find_element(By.TAG_NAME, "body").text.lower()
+            completion_found = any(pattern in body_text for pattern in self.COMPLETION_PATTERNS)
+
+            if completion_found:
+                logger.info("[📤 SUBMIT] ✅ Completion confirmed!")
+                self._finalize_session(status="completed")
+                return True
+            else:
+                logger.warning("[📤 SUBMIT] Completion page not confirmed — may need manual verification")
+                # Still record as completed if we navigated away from survey
+                current_url = self.driver.current_url.lower()
+                if "survey" not in current_url and "quiz" not in current_url:
+                    logger.info("[📤 SUBMIT] URL changed away from survey — assuming completion")
+                    self._finalize_session(status="completed")
+                    return True
+                return False
+
+        except Exception as e:
+            logger.error(f"[📤 SUBMIT] Completion check failed: {e}")
+            return False
+
+    def _finalize_session(self, status: str):
+        """Finalize the current session: update stats, save cookies, persist stats.
+
+        Args:
+            status: Session outcome - "completed", "dq", "error", "manual_stop", "too_fast"
+        """
+        self.session_stats["status"] = status
+        self.session_stats["duration_sec"] = round(time.time() - self.session_stats["start_time"])
+
+        logger.info(f"[📊 SESSION END] Status: {status} | Duration: {self.session_stats['duration_sec']}s")
+
+        # Save cookies
+        try:
+            self.save_cookies()
+        except Exception as e:
+            logger.debug(f"Failed to save cookies during finalization: {e}")
+
+        # Save session stats
+        self._save_session_stats()
+
+    def _save_session_stats(self):
+        """Persist session statistics to JSONL file.
+
+        File: profiles/<profile_name>/session_stats.jsonl
+        Format: One JSON object per line (append mode)
+        """
+        stats_path = os.path.join(
+            self.profile_mgr.get_profile_path(self.profile_name),
+            "session_stats.jsonl"
+        )
+
+        record = {
+            "timestamp": datetime.datetime.now().isoformat(),
+            "url": self.session_stats.get("url", self.driver.current_url if self.driver else None),
+            "status": self.session_stats["status"],
+            "pages": self.session_stats["pages_seen"],
+            "actions": self.session_stats["actions_taken"],
+            "duration_sec": self.session_stats["duration_sec"],
+            "dq": self.session_stats["status"] == "dq",
+            "learned_rules_added": self.rules_added_this_session,
+        }
+
+        try:
+            with open(stats_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record) + "\n")
+            logger.info(f"[📊 STATS] Session stats saved to {stats_path}")
+        except Exception as e:
+            logger.error(f"[📊 STATS] Failed to save session stats: {e}")
 
     def run_manual_hud(self, target_url=None):
         if target_url:
@@ -1233,6 +1501,10 @@ class SentinelSurveyBot:
             logger.info(f"    [🌐 NAVIGATED] Now at: {self.driver.current_url}")
             logger.info(f"    [📄 PAGE TITLE] {self.driver.title}")
             self.load_cookies()
+
+        # Initialize session stats URL
+        self.session_stats["url"] = self.driver.current_url
+
         logger.info("[+] SentinelCore Manual HUD Active. Monitoring screen for questions...")
         logger.info("[+] Hotkey Active: Press 'P' in this console at any time to PAUSE/RESUME the scanner.")
         
@@ -1291,6 +1563,7 @@ class SentinelSurveyBot:
                     if any(k in current_url for k in ["disqualified", "screenout", "reward=0", "&term="]):
                         if self.memory_log:
                             self.learn_from_disqualification()
+                        self._finalize_session(status="dq")
                         time.sleep(5)
                         continue
 
@@ -1412,6 +1685,7 @@ class SentinelSurveyBot:
                         last_fingerprint = current_fingerprint
                         fingerprint_since = time.time()
                         screenshot_taken_for_current = False
+                        self.session_stats["pages_seen"] += 1  # Track page advance
                     
                     image_context = ""
                     try:
@@ -1522,12 +1796,83 @@ class SentinelSurveyBot:
                 logger.info("[+] Cookies saved.")
             except Exception as e:
                 logger.debug(f"[-] Failed to save cookies during shutdown: {e}")
+            # Finalize session stats (manual stop)
+            if self.session_stats["status"] == "running":
+                self._finalize_session(status="manual_stop")
             try:
                 if self.driver:
                     self.driver.quit()
                     logger.info("[+] Browser closed.")
             except Exception:
                 logger.debug("swallowed exception in bot.py", exc_info=True)
+
+    def _load_script(self, script_name):
+        """Load a JavaScript file from the scripts directory."""
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts", script_name)
+        try:
+            with open(script_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except FileNotFoundError:
+            logger.error(f"[-] Script not found: {script_path}")
+            return None
+        except Exception as e:
+            logger.error(f"[-] Failed to load script {script_name}: {e}")
+            return None
+
+    def extract_question_data(self):
+        """Extract question data from any survey page using DOM analysis.
+
+        Reads the page's own structure to determine:
+        - Question text from common selectors
+        - Question type (CHECKBOX, SELECT, DROPDOWN, TEXT, unknown)
+        - Available options with their text and values
+
+        Works across multiple survey platforms (Swagbucks, Qualtrics,
+        SurveyMonkey, Typeform, Prolific, etc.)
+
+        Returns:
+            dict with keys: QUESTION, TYPE, OPTIONS, RAW_TEXT
+        """
+        script = self._load_script("get_question.js")
+        if script is None:
+            return None
+        try:
+            result = self.driver.execute_script(script)
+            if result and result.get("QUESTION"):
+                logger.info(f"[📋 QUESTION] {result['QUESTION'][:100]}...")
+                logger.info(f"[📋 TYPE] {result.get('TYPE', 'unknown')}")
+                logger.info(f"[📋 OPTIONS] {len(result.get('OPTIONS', []))}")
+            return result
+        except Exception as e:
+            logger.error(f"[-] extract_question_data failed: {e}")
+            return None
+
+    def submit_answer(self, option_index):
+        """Submit an answer by clicking an option and triggering native save.
+
+        Clicks the option element and calls the page's own internal
+        save function if available (e.g., sp.saveAnswer on Swagbucks,
+        survey.saveAnswer on Qualtrics, etc.).
+
+        Args:
+            option_index: Index of the option to select (from extract_question_data)
+
+        Returns:
+            dict with success status and method used
+        """
+        script = self._load_script("answer_question.js")
+        if script is None:
+            return None
+        try:
+            result = self.driver.execute_script(script, option_index)
+            if result and result.get("success"):
+                logger.info(f"[✅ ANSWER SAVED] via {result.get('method', 'unknown')}")
+            else:
+                logger.warning(f"[!] Answer failed: {result.get('error', 'unknown error')}")
+            return result
+        except Exception as e:
+            logger.error(f"[-] submit_answer failed: {e}")
+            return None
 
     def run(self, target_url):
         self.run_manual_hud(target_url)
