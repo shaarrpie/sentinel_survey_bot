@@ -1118,6 +1118,9 @@ class BrowserController:
         This method detects new window handles and returns the URL of the
         most recently opened tab, or None if no new tabs.
 
+        CRITICAL: Always restores the required (primary) browsing context
+        before returning, so subsequent commands target the survey tab.
+
         Returns:
             URL of new tab if detected, None otherwise
         """
@@ -1128,30 +1131,59 @@ class BrowserController:
             # Initialize known handles on first call
             if not hasattr(self, '_known_window_handles') or not self._known_window_handles:
                 self._known_window_handles = current_handles
+                # The tab that was current at survey start is the REQUIRED
+                # target; every cleanup must preserve it.
+                try:
+                    self._primary_window = self.driver.current_window_handle
+                except Exception:
+                    self._primary_window = None
                 return None
 
             new_handles = current_handles - self._known_window_handles
             if new_handles:
-                # New tab detected — switch to it and get URL
-                new_handle = list(new_handles)[-1]  # most recent
-                self.driver.switch_to.window(new_handle)
-                new_url = self.driver.current_url
-                debug_log.info(
-                    f"NEW TAB DETECTED | url={new_url[:100]} | "
-                    f"total_tabs={len(current_handles)}",
-                    extra={"stage": "TabMonitor"},
-                )
-                # Update known handles
-                self._known_window_handles = current_handles
-                return new_url
+                # New tab detected — peek at its URL WITHOUT abandoning the
+                # required context. Set order is arbitrary; sort for
+                # determinism (it is NOT recency).
+                new_handle = sorted(new_handles)[0]
+                original = getattr(self, "_primary_window", None)
+                try:
+                    self.driver.switch_to.window(new_handle)
+                    new_url = self.driver.current_url
+                    debug_log.info(
+                        f"NEW TAB DETECTED | url={new_url[:100]} | "
+                        f"total_tabs={len(current_handles)}",
+                        extra={"stage": "TabMonitor"},
+                    )
+                    # Update known handles
+                    self._known_window_handles = current_handles
+                    return new_url
+                finally:
+                    # ALWAYS re-establish the required browsing context
+                    # before any capture/command continues.
+                    try:
+                        if original in self.driver.window_handles:
+                            self.driver.switch_to.window(original)
+                    except Exception:
+                        debug_log.error(
+                            "TAB RESTORE FAILED | required window lost",
+                            extra={"stage": "TabMonitor"},
+                        )
+                        raise
 
             # Check for closed tabs
             closed = self._known_window_handles - current_handles
             if closed:
                 self._known_window_handles = current_handles
-                # If our tab was closed, switch to remaining tab
-                if len(current_handles) > 0:
-                    self.driver.switch_to.window(list(current_handles)[0])
+                # If our primary tab was closed, switch to remaining tab
+                primary = getattr(self, "_primary_window", None)
+                if primary not in current_handles and len(current_handles) > 0:
+                    # Primary is gone — log loudly, don't guess
+                    debug_log.error(
+                        f"PRIMARY WINDOW LOST | primary={primary} "
+                        f"not in remaining={current_handles}",
+                        extra={"stage": "TabMonitor"},
+                    )
+                    self._primary_window = list(current_handles)[0]
 
             return None
         except Exception as e:
@@ -1159,9 +1191,12 @@ class BrowserController:
             return None
 
     def close_extra_tabs(self):
-        """Close all tabs except the current one.
+        """Close all tabs except the REQUIRED (survey) window, then
+        explicitly re-establish the required context.
 
-        Useful for cleaning up tabs opened by survey routers.
+        Never keys off 'current' — the current window may be the intruder
+        itself (e.g., DevTools opened by F12). The required window is the
+        one that was current when check_new_tabs() was first called.
         """
         if not self.driver:
             return
@@ -1169,18 +1204,39 @@ class BrowserController:
             handles = self.driver.window_handles
             if len(handles) <= 1:
                 return
-            current = self.driver.current_window_handle
-            for handle in handles:
-                if handle != current:
-                    self.driver.switch_to.window(handle)
+            primary = getattr(self, "_primary_window", None)
+            if primary not in handles:
+                debug_log.error(
+                    f"TAB CLEANUP ABORTED | required window {primary} "
+                    f"not in handles={handles} — not guessing",
+                    extra={"stage": "TabMonitor"},
+                )
+                return
+            for h in handles:
+                if h == primary:
+                    continue
+                try:
+                    self.driver.switch_to.window(h)
                     self.driver.close()
-            self.driver.switch_to.window(current)
+                    debug_log.info(
+                        f"TAB CLOSED | handle={h[:12]}... (non-primary)",
+                        extra={"stage": "TabMonitor"},
+                    )
+                except Exception as e:
+                    debug_log.warning(
+                        f"TAB CLOSE FAILED | handle={h[:12]}... | {e}",
+                        extra={"stage": "TabMonitor"},
+                    )
+            # Re-establish the required target before returning control.
+            self.driver.switch_to.window(primary)
+            self._known_window_handles = {primary}
             debug_log.info(
-                f"CLOSED EXTRA TABS | remaining=1",
+                f"CLOSED EXTRA TABS | remaining=1 (primary={primary[:12]}...)",
                 extra={"stage": "TabMonitor"},
             )
         except Exception as e:
             logger.debug(f"close_extra_tabs failed: {e}", exc_info=True)
+            raise
 
 class AIEngine:
     COMMON_ANSWERS = {
@@ -1697,9 +1753,6 @@ class SurveyBot:
         self.last_action_fingerprint: Optional[str] = None
         self.profile_name = profile_name
         self.guard = SessionGuard(debug_log)
-        # Tab monitoring state
-        self._known_window_handles: set = set()
-        self._original_window: Optional[str] = None
 
     def _extract_persona_keywords(self, page_text: str) -> List[str]:
         """Extract persona keywords relevant for dropdown matching.
@@ -2885,12 +2938,24 @@ class SurveyBot:
             has_next = any(a.action_type == "next" for a in decision.actions)
             if not has_next:
                 qtypes = ("single_choice", "multi_choice", "text", "dropdown", "grid")
-                if decision.question_type in qtypes:
+                # Never auto-advance when NO answer action succeeded —
+                # that would submit an unanswered question (secondary defect).
+                if decision.question_type in qtypes and sum(action_results) > 0:
                     time.sleep(0.5)
                     if self.browser.click_next():
                         debug_log.info(
                             "Auto-clicked Next", extra={"stage": "Nav"}
                         )
+                    else:
+                        debug_log.warning(
+                            "AUTO_NEXT FAILED | no next button found",
+                            extra={"stage": "Nav"},
+                        )
+                elif decision.question_type in qtypes:
+                    debug_log.warning(
+                        "AUTO_NEXT SUPPRESSED | no answer action succeeded",
+                        extra={"stage": "Nav"},
+                    )
 
         # --- Memory & cache ---
         if decision.memory_note:
