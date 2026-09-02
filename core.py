@@ -2214,6 +2214,18 @@ class SurveyBot:
         post_checked = self._get_checked_count()
         if pre_checked_count is not None and post_checked is not None and post_checked != pre_checked_count:
             return True
+        # Also check for aria-checked / styled quiz options (ProProfs uses
+        # <li>/<div> with JS-attached click handlers, no native <input>)
+        try:
+            post_aria = self.browser.driver.execute_script("""
+                return document.querySelectorAll(
+                    '[aria-checked="true"], .selected, .active-option, .chosen'
+                ).length;
+            """)
+            if post_aria > 0:
+                return True
+        except Exception:
+            pass
         print("[!] Action had no effect")
         return False
 
