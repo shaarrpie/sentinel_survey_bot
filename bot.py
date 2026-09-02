@@ -32,6 +32,7 @@ from PIL import Image
 import pytesseract
 
 from participant_profile import get_persona, save_answer, get_cached_answer
+from run_logger import RunLogger, detect_bot_type
 
 if not os.path.exists("logs"):
     os.makedirs("logs")
@@ -344,6 +345,30 @@ class SentinelSurveyBot:
         self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
             "source": self._stealth_script()
         })
+
+        # ── Per-run structured logging ──
+        self.run_logger: RunLogger | None = None
+
+    def start_run(self, url: str | None = None, bot_type: str | None = None):
+        """Start a new structured run log.
+
+        Args:
+            url: The survey URL (used to auto-detect bot_type if not given)
+            bot_type: Override the auto-detected bot type (swagbucks, prolific, etc.)
+        """
+        if self.run_logger:
+            self.run_logger.close()
+
+        detected_type = bot_type or detect_bot_type(url or "")
+        self.run_logger = RunLogger(detected_type)
+        logger.info(f"[📝 RUN LOG] Started {detected_type} run: {self.run_logger.run_id}")
+        return self.run_logger
+
+    def end_run(self):
+        """Finalize the current run log."""
+        if self.run_logger:
+            self.run_logger.close()
+            self.run_logger = None
 
     @staticmethod
     def _stealth_script() -> str:
@@ -1505,6 +1530,9 @@ class SentinelSurveyBot:
         # Initialize session stats URL
         self.session_stats["url"] = self.driver.current_url
 
+        # Start structured run logging
+        self.start_run(target_url or self.driver.current_url)
+
         logger.info("[+] SentinelCore Manual HUD Active. Monitoring screen for questions...")
         logger.info("[+] Hotkey Active: Press 'P' in this console at any time to PAUSE/RESUME the scanner.")
         
@@ -1564,6 +1592,8 @@ class SentinelSurveyBot:
                         if self.memory_log:
                             self.learn_from_disqualification()
                         self._finalize_session(status="dq")
+                        if self.run_logger:
+                            self.run_logger.log_disqualification(f"URL: {current_url[:100]}")
                         time.sleep(5)
                         continue
 
@@ -1686,6 +1716,8 @@ class SentinelSurveyBot:
                         fingerprint_since = time.time()
                         screenshot_taken_for_current = False
                         self.session_stats["pages_seen"] += 1  # Track page advance
+                        if self.run_logger:
+                            self.run_logger.log_page_state(current_url, current_fingerprint)
                     
                     image_context = ""
                     try:
@@ -1761,6 +1793,9 @@ class SentinelSurveyBot:
                         if ans:
                             self.memory_log.append(f"Q: {current_text[:150].replace(chr(10), ' ')}... -> A: {ans}")
                             save_answer(current_text.strip(), ans.strip())
+                            if self.run_logger:
+                                self.run_logger.log_question(current_text, "DROPDOWN", [{"text": o} for o in options_text_list])
+                                self.run_logger.log_ai_decision("Sniper keyword: " + str(keyword), 0, str(ans))
                     else:
                         logger.info(f"[*] New Question Detected! ({len(options_text_list)} options) Asking AI...")
                         self.human_reading_delay(current_text[:400])
@@ -1777,6 +1812,10 @@ class SentinelSurveyBot:
                             
                             self.memory_log.append(f"Q: {current_text[:150].replace(chr(10), ' ')}... -> A: {analysis_block[:150]}")
                             save_answer(current_text.strip(), ans.strip())
+                            if self.run_logger:
+                                q_type = "SELECT" if len(options_text_list) <= 5 else "MULTI"
+                                self.run_logger.log_question(current_text, q_type, [{"text": o} for o in options_text_list])
+                                self.run_logger.log_ai_decision(analysis_block[:200], 0, str(ans)[:100])
                             self.execute_autonomous_action(ans, options_elements)
                     logger.info("="*60 + "\n")
                     self.save_cookies()
@@ -1799,6 +1838,11 @@ class SentinelSurveyBot:
             # Finalize session stats (manual stop)
             if self.session_stats["status"] == "running":
                 self._finalize_session(status="manual_stop")
+            # Close run logger
+            if self.run_logger:
+                if self.session_stats["status"] == "completed":
+                    self.run_logger.log_completion()
+                self.end_run()
             try:
                 if self.driver:
                     self.driver.quit()
@@ -1842,9 +1886,19 @@ class SentinelSurveyBot:
                 logger.info(f"[📋 QUESTION] {result['QUESTION'][:100]}...")
                 logger.info(f"[📋 TYPE] {result.get('TYPE', 'unknown')}")
                 logger.info(f"[📋 OPTIONS] {len(result.get('OPTIONS', []))}")
+                if self.run_logger:
+                    self.run_logger.log_question(
+                        result["QUESTION"],
+                        result.get("TYPE", "unknown"),
+                        result.get("OPTIONS", [])
+                    )
+            elif result and result.get("error") and self.run_logger:
+                self.run_logger.log_error(result["error"], "extract_question_data")
             return result
         except Exception as e:
             logger.error(f"[-] extract_question_data failed: {e}")
+            if self.run_logger:
+                self.run_logger.log_error(str(e), "extract_question_data")
             return None
 
     def submit_answer(self, option_index):
@@ -1867,11 +1921,19 @@ class SentinelSurveyBot:
             result = self.driver.execute_script(script, option_index)
             if result and result.get("success"):
                 logger.info(f"[✅ ANSWER SAVED] via {result.get('method', 'unknown')}")
+                if self.run_logger:
+                    self.run_logger.log_action("CLICK", idx=option_index, method=result.get("method", "unknown"), success=True)
+                    if result.get("method") not in ("click", "dispatchEvent", "click_only"):
+                        self.run_logger.log_native_api(result["method"], True)
             else:
                 logger.warning(f"[!] Answer failed: {result.get('error', 'unknown error')}")
+                if self.run_logger:
+                    self.run_logger.log_action("CLICK", idx=option_index, success=False, error=result.get("error", "unknown"))
             return result
         except Exception as e:
             logger.error(f"[-] submit_answer failed: {e}")
+            if self.run_logger:
+                self.run_logger.log_error(str(e), "submit_answer")
             return None
 
     def run(self, target_url):
