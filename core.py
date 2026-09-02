@@ -937,7 +937,32 @@ class BrowserController:
         framework-controlled inputs.
         """
         sel = f"[data-bot-id='{element_id}']"
-        el = self.driver.find_element(By.CSS_SELECTOR, sel)
+        try:
+            el = self.driver.find_element(By.CSS_SELECTOR, sel)
+        except (NoSuchElementException, StaleElementReferenceException):
+            debug_log.warning(
+                f"TYPE_INTO | element_id={element_id} not found or stale",
+                extra={"stage": "Action"},
+            )
+            return False
+
+        # Null/stale guard — Selenium sometimes hands JS a dead reference
+        # when the DOM re-renders (ProProfs SPA). Detect before dispatching.
+        alive = self.driver.execute_script(
+            "return arguments[0] !== null && arguments[0] !== undefined && "
+            "typeof arguments[0].dispatchEvent === 'function';",
+            el,
+        )
+        if not alive:
+            debug_log.warning(
+                f"TYPE_INTO | element_id={element_id} is stale/null — re-acquiring",
+                extra={"stage": "Action"},
+            )
+            try:
+                el = self.driver.find_element(By.CSS_SELECTOR, sel)
+            except Exception:
+                return False
+
         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
 
         if human_like:
@@ -1865,15 +1890,34 @@ class SurveyBot:
         # Filter to viewport-visible elements only — ProProfs loads ALL
         # questions' radios into the DOM (hidden or in containers), which
         # would otherwise cause simple single-choice questions to be
-        # misread as grids.
-        visible = [e for e in elements if e.get("y", 0) > 0]
+        # misread as grids. We dynamically resolve viewport height so the
+        # filter adapts to whatever window size the browser is using.
+        try:
+            from selenium import webdriver  # noqa: F401  (ensure import side-effects)
+            from selenium.webdriver.remote.webdriver import WebDriver
+        except Exception:
+            WebDriver = None  # type: ignore[assignment]
+        viewport_h = 800
+        try:
+            # Try SurveyBot instance attribute (passed via class method is awkward;
+            # fall back to module-level default if not resolvable here).
+            drv = getattr(SurveyBot, "_viewport_driver_ref", None)
+            if drv is not None:
+                vh = drv.execute_script(
+                    "return (window.innerHeight || document.documentElement.clientHeight || 800);"
+                )
+                if isinstance(vh, (int, float)) and vh > 0:
+                    viewport_h = int(vh)
+        except Exception:
+            pass
+        visible = [e for e in elements if 0 < e.get("y", 0) < viewport_h]
         radios = [e for e in visible if e.get("type") == "radio"]
         checkboxes = [e for e in visible if e.get("type") == "checkbox"]
         selects = [e for e in visible if e.get("tag") == "select"]
         text_inputs = [e for e in visible if e.get("type") in ("text", "number", "email", "tel", "date")]
 
         # Grid detection: many radios with row-like structure
-        if len(radios) > 10:
+        if len(radios) > 6:
             # Check if radios share names in a grid pattern (matrix question)
             name_groups = {}
             for r in radios:
@@ -2205,13 +2249,27 @@ class SurveyBot:
         self.stuck_since = 0
 
     def _verify_action(self, pre_fingerprint: str, pre_checked_count: Optional[int] = None) -> bool:
+        t0 = time.perf_counter()
         time.sleep(1.2)
+        t1 = time.perf_counter()
         post_fingerprint = self._page_fingerprint()
+        t2 = time.perf_counter()
         if post_fingerprint != pre_fingerprint:
+            debug_log.debug(
+                f"VERIFY timing: sleep={t1-t0:.2f}s fingerprint={t2-t1:.2f}s "
+                f"(text changed)",
+                extra={"stage": "Verify"},
+            )
             return True
         # Text didn't change — check if a radio/checkbox state changed
         # (the actual effect of clicking an answer option on ProProfs)
         post_checked = self._get_checked_count()
+        t3 = time.perf_counter()
+        debug_log.debug(
+            f"VERIFY timing: sleep={t1-t0:.2f}s fp={t2-t1:.2f}s "
+            f"checked={t3-t2:.2f}s | total={t3-t0:.2f}s",
+            extra={"stage": "Verify"},
+        )
         if pre_checked_count is not None and post_checked is not None and post_checked != pre_checked_count:
             return True
         # Also check for aria-checked / styled quiz options (ProProfs uses
@@ -2574,6 +2632,7 @@ class SurveyBot:
                 1 for e in elements if e.get("text") or e.get("tag")
             )
             # Detect question type from element structure
+            SurveyBot._viewport_driver_ref = self.browser.driver
             detected_type = self.detect_question_type(elements)
             debug_log.debug(
                 f"Elements: total={len(elements)} visible={visible_elements} "
@@ -2734,6 +2793,7 @@ class SurveyBot:
         # Detect question type from elements and enforce constraints
         # on the AI's actions (e.g., only one click for single-choice)
         with StageTimer(debug_log, "enforce_question_type"):
+            SurveyBot._viewport_driver_ref = self.browser.driver
             detected_type = self.detect_question_type(elements)
             # Use the more specific type: prefer detected over AI's guess
             # when detected is not unknown (AI may misclassify)
