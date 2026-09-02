@@ -528,15 +528,16 @@ class BrowserController:
         # never approach 1000 entries per context).
         start_id = 0 if frame_index is None else (frame_index + 1) * 1000
         try:
-            result = self.driver.execute_script("""(startId) => {
+            result = self.driver.execute_script(r"""
                 const elements = [];
+                const startId = arguments[0];
                 // Clear stale ids from the previous scan — on SPA-style surveys
                 // the DOM partially persists and [data-bot-id='7'] would match
                 // the first stale node, not the current question's.
                 document.querySelectorAll('[data-bot-id]')
                     .forEach(el => el.removeAttribute('data-bot-id'));
                 document.querySelectorAll(
-                    'button, input, select, textarea, a, [role="button"], [role="radio"], [role="checkbox"], label, .answer-option, .survey-option'
+                    'button, input, select, textarea, a, [onclick], [tabindex], [role="button"], [role="radio"], [role="checkbox"], label, .answer-option, .survey-option'
                 ).forEach((el, idx) => {
                     if (el.offsetParent === null) return;
                     const rect = el.getBoundingClientRect();
@@ -582,7 +583,7 @@ class BrowserController:
                     elements.push(entry);
                 });
                 return elements;
-            }""", start_id)
+            """, start_id)
         except Exception as e:
             debug_log.warning(
                 f"element scan failed (frame={frame_index}): {e}",
