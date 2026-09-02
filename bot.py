@@ -962,10 +962,11 @@ class SentinelSurveyBot:
         single-choice questions.
         """
         if question_type == "single_choice":
-            # Only allow one click for single-choice
             if len(click_targets) > 1:
                 return [click_targets[0]]
         return click_targets
+
+    def _set_input_value_with_events(self, element, value):
         """For React/Vue/etc. that watch the value via the native input
         event: set ``.value`` and dispatch ``input`` and ``change``.
         Used for non-contenteditable inputs that need framework sync."""
