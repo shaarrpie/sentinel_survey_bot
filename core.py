@@ -765,7 +765,15 @@ class BrowserController:
                 if parent_label:
                     el = parent_label
 
-            self.driver.execute_script("arguments[0].click();", el)
+            # Native Selenium click — goes through the full mousedown/mouseup/click
+            # event lifecycle that jQuery event delegation (ProProfs) relies on.
+            # JS execute_script("click()") only dispatches a synthetic click event
+            # which jQuery often doesn't bind to.
+            try:
+                el.click()
+            except ElementClickInterceptedException:
+                # Overlay/interception — fall back to JS click as last resort
+                self.driver.execute_script("arguments[0].click();", el)
             return True
         finally:
             self._reset_frame()
@@ -991,18 +999,42 @@ class BrowserController:
         return False
 
     def click_next(self) -> bool:
+        # Pass 0: ProProfs-specific selectors
+        proprofs_selectors = [
+            ".quiz-next", ".next-question", "#nextBtn",
+            ".btn-next", ".pq-next", "[data-action='next']",
+            ".action-next", ".question-next",
+            "a.pq-next-btn", "div.pq-next-btn",
+            ".submit-btn", "#submitBtn",
+            ".pq-next-btn", ".next-btn", ".btn-next-question",
+        ]
+        for sel in proprofs_selectors:
+            try:
+                els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                for el in els:
+                    if el.is_displayed() and el.is_enabled():
+                        self.driver.execute_script(
+                            "arguments[0].scrollIntoView({block:'center'});", el)
+                        try:
+                            el.click()
+                        except ElementClickInterceptedException:
+                            self.driver.execute_script("arguments[0].click();", el)
+                        return True
+            except Exception:
+                pass
+
         # Pass 1: JS text match — :contains() is jQuery and raises
         # InvalidSelectorException in Selenium, so the old first three
         # selectors never ran.
         try:
             clicked = self.driver.execute_script("""
-                const re = /\\b(next|continue|submit|send|finish)\\b/i;
+                const re = /\\b(next|continue|submit|send|finish|→|>|»)\\b/i;
                 const cands = Array.from(document.querySelectorAll(
-                    'button, input[type=submit], input[type=button], [role=button], a[href]'));
+                    'button, input[type=submit], input[type=button], [role=button], a, div[class*="next"], span[class*="next"], div[class*="btn"], span[class*="btn"], div[class*="pq"], span[class*="pq"]'));
                 for (const el of cands) {
                     if (!el.offsetParent || el.disabled) continue;
                     const t = (el.innerText || el.value ||
-                               el.getAttribute('aria-label') || '');
+                               el.getAttribute('aria-label') || el.className || '');
                     if (re.test(t)) {
                         el.scrollIntoView({block: 'center'});
                         el.click();
@@ -1016,7 +1048,7 @@ class BrowserController:
         except Exception:
             logger.debug("JS next-button pass failed", exc_info=True)
         # Pass 2: the attribute-substring selectors that always worked.
-        for sel in ("[id*='next' i]", "[class*='next' i]", "[class*='continue' i]",
+        for sel in ("[id*='next' i]", "[class*='next' i]", "[class*='continue' i]", "[class*='pq' i]",
                     "input[type='submit']"):
             try:
                 els = self.driver.find_elements(By.CSS_SELECTOR, sel)
@@ -1830,10 +1862,15 @@ class SurveyBot:
         multi-select, dropdown, text, or grid. Used to enforce correct
         execution behavior (e.g., only one click for single-choice).
         """
-        radios = [e for e in elements if e.get("type") == "radio"]
-        checkboxes = [e for e in elements if e.get("type") == "checkbox"]
-        selects = [e for e in elements if e.get("tag") == "select"]
-        text_inputs = [e for e in elements if e.get("type") in ("text", "number", "email", "tel", "date")]
+        # Filter to viewport-visible elements only — ProProfs loads ALL
+        # questions' radios into the DOM (hidden or in containers), which
+        # would otherwise cause simple single-choice questions to be
+        # misread as grids.
+        visible = [e for e in elements if e.get("y", 0) > 0]
+        radios = [e for e in visible if e.get("type") == "radio"]
+        checkboxes = [e for e in visible if e.get("type") == "checkbox"]
+        selects = [e for e in visible if e.get("tag") == "select"]
+        text_inputs = [e for e in visible if e.get("type") in ("text", "number", "email", "tel", "date")]
 
         # Grid detection: many radios with row-like structure
         if len(radios) > 10:
@@ -1842,9 +1879,12 @@ class SurveyBot:
             for r in radios:
                 name = r.get("name", "")
                 name_groups[name] = name_groups.get(name, 0) + 1
-            # If we have multiple groups of radios, it's likely a grid
+            # If we have multiple groups of radios, it's likely a grid.
+            # Require >=3 groups (ProProfs single-choice questions embed
+            # multiple questions' radios in the DOM, but a true matrix
+            # question has 3+ row groups).
             multi_groups = [n for n, count in name_groups.items() if count > 1]
-            if len(multi_groups) >= 2:
+            if len(multi_groups) >= 3:
                 return "grid"
 
         # Single choice: radios without checkboxes
@@ -1961,6 +2001,19 @@ class SurveyBot:
                 max_time += min(word_count / 30, 15)
 
         return random.uniform(min_time, max_time)
+
+    def _get_checked_count(self) -> Optional[int]:
+        """Count currently-checked radios/checkboxes — used to verify
+        that a click actually toggled a radio (text fingerprint alone
+        won't detect a radio toggle on ProProfs)."""
+        try:
+            return self.browser.driver.execute_script("""
+                return document.querySelectorAll(
+                    'input[type=radio]:checked, input[type=checkbox]:checked'
+                ).length;
+            """)
+        except Exception:
+            return None
 
     def _page_fingerprint(self) -> str:
         text = self.browser.get_page_text()[:3000]
@@ -2151,13 +2204,18 @@ class SurveyBot:
         self.stuck_fingerprint = None
         self.stuck_since = 0
 
-    def _verify_action(self, pre_fingerprint: str) -> bool:
-        time.sleep(0.8)
+    def _verify_action(self, pre_fingerprint: str, pre_checked_count: Optional[int] = None) -> bool:
+        time.sleep(1.2)
         post_fingerprint = self._page_fingerprint()
-        if post_fingerprint == pre_fingerprint:
-            print("[!] Action had no effect")
-            return False
-        return True
+        if post_fingerprint != pre_fingerprint:
+            return True
+        # Text didn't change — check if a radio/checkbox state changed
+        # (the actual effect of clicking an answer option on ProProfs)
+        post_checked = self._get_checked_count()
+        if pre_checked_count is not None and post_checked is not None and post_checked != pre_checked_count:
+            return True
+        print("[!] Action had no effect")
+        return False
 
     def run(self, url: str):
         self.browser.start()
@@ -2731,6 +2789,7 @@ class SurveyBot:
                         )
                         act = act.model_copy(update={"element_id": None})
                 pre_fp = self._page_fingerprint()
+                pre_checked = self._get_checked_count()
                 action_ok = False
                 try:
                     if act.action_type == "click":
@@ -2928,7 +2987,7 @@ class SurveyBot:
                 verified = None
                 if act.action_type != "wait":
                     with StageTimer(debug_log, "verify_action"):
-                        verified = self._verify_action(pre_fp)
+                        verified = self._verify_action(pre_fp, pre_checked)
                         if not verified:
                             debug_log.warning(
                                 f"Action {act.action_type} had no effect",

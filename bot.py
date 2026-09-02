@@ -911,10 +911,15 @@ class SentinelSurveyBot:
         multi-select, dropdown, text, or grid. Used to enforce correct
         execution behavior (e.g., only one click for single-choice).
         """
-        radios = [e for e in elements if (e.get_attribute("type") or "").lower() == "radio"]
-        checkboxes = [e for e in elements if (e.get_attribute("type") or "").lower() == "checkbox"]
-        selects = [e for e in elements if e.tag_name.lower() == "select"]
-        text_inputs = [e for e in elements if (e.get_attribute("type") or "").lower() in ("text", "number", "email", "tel", "date")]
+        # Filter to visible elements only — ProProfs loads ALL questions'
+        # radios into the DOM (hidden or in containers), which would
+        # otherwise cause simple single-choice questions to be misread
+        # as grids.
+        visible = [e for e in elements if e.is_displayed() and e.is_enabled()]
+        radios = [e for e in visible if (e.get_attribute("type") or "").lower() == "radio"]
+        checkboxes = [e for e in visible if (e.get_attribute("type") or "").lower() == "checkbox"]
+        selects = [e for e in visible if e.tag_name.lower() == "select"]
+        text_inputs = [e for e in visible if (e.get_attribute("type") or "").lower() in ("text", "number", "email", "tel", "date")]
 
         # Grid detection: many radios with row-like structure
         if len(radios) > 10:
@@ -923,7 +928,10 @@ class SentinelSurveyBot:
                 name = r.get_attribute("name") or ""
                 name_groups[name] = name_groups.get(name, 0) + 1
             multi_groups = [n for n, count in name_groups.items() if count > 1]
-            if len(multi_groups) >= 2:
+            # Require >=3 groups (ProProfs single-choice questions embed
+            # multiple questions' radios in the DOM, but a true matrix
+            # question has 3+ row groups).
+            if len(multi_groups) >= 3:
                 return "grid"
 
         # Single choice: radios without checkboxes
