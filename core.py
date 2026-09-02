@@ -610,33 +610,47 @@ class BrowserController:
         # the scan result.
         if frame_index is None and not (result or []):
             try:
-                census = self.driver.execute_script("""
+                census = self.driver.execute_script(r"""
                     var selector = 'button, input, select, textarea, a, label, [onclick], [role="button"], [role="link"]';
                     var all = document.querySelectorAll(selector);
-                    var matches = all.length;
-                    var hidden_null = 0, small = 0;
+                    var reasons = {total: all.length, pass: 0};
+                    function bump(k) { reasons[k] = (reasons[k] || 0) + 1; }
+                    var sample = [];
                     all.forEach(function(el) {
-                        if (el.offsetParent === null) hidden_null++;
                         var r = el.getBoundingClientRect();
-                        if (r.width < 5 || r.height < 5) small++;
+                        var cs = getComputedStyle(el);
+                        var ok = true;
+                        if (!el.getClientRects().length)  { bump('not_rendered'); ok = false; }
+                        if (cs.display === 'none')        { bump('display_none'); ok = false; }
+                        if (cs.visibility === 'hidden')   { bump('visibility_hidden'); ok = false; }
+                        if (parseFloat(cs.opacity) === 0) { bump('opacity_zero'); ok = false; }
+                        if (r.width < 5 || r.height < 5)  { bump('too_small'); ok = false; }
+                        var txt = (el.innerText || el.value || el.getAttribute('aria-label') || '').trim();
+                        if (!txt) { bump('no_text'); ok = false; }
+                        if (r.bottom < 0 || r.right < 0 || r.top > innerHeight || r.left > innerWidth) {
+                            bump('outside_viewport'); ok = false;
+                        }
+                        if (ok) {
+                            reasons.pass++;
+                            if (sample.length < 20) sample.push({
+                                tag: el.tagName, cls: String(el.className).slice(0, 50),
+                                txt: txt.slice(0, 40), w: Math.round(r.width), h: Math.round(r.height)
+                            });
+                        }
                     });
-                    return {
-                        matches: matches,
-                        hidden_null: hidden_null,
-                        small: small,
-                        readyState: document.readyState,
-                        visibilityState: document.visibilityState
-                    };
+                    reasons.iframes = document.querySelectorAll('iframe').length;
+                    reasons.radios = document.querySelectorAll('input[type=radio],input[type=checkbox]').length;
+                    reasons.sample = sample;
+                    return reasons;
                 """)
+                reasons_str = " ".join(f"{k}={v}" for k, v in census.items() if k != "sample")
+                debug_log.warning(f"ELEMENT MAP EMPTY | frame=top | {reasons_str}",
+                                  extra={"stage": "QuestionDetection"})
                 debug_log.warning(
-                    f"ELEMENT MAP EMPTY | frame=top | "
-                    f"matches={census['matches']} "
-                    f"hidden_null={census['hidden_null']} "
-                    f"small={census['small']} | "
-                    f"readyState={census['readyState']} | "
-                    f"visibilityState={census['visibilityState']}",
-                    extra={"stage": "QuestionDetection"},
-                )
+                    "ELEMENT MAP EMPTY | visible sample: "
+                    + "; ".join(f"<{s['tag']} class={s['cls']!r} text={s['txt']!r} {s['w']}x{s['h']}>"
+                                for s in census.get("sample", [])),
+                    extra={"stage": "QuestionDetection"})
             except Exception as e:
                 debug_log.warning(
                     f"ELEMENT MAP EMPTY census_failed: {e}",
