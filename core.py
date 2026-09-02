@@ -2815,6 +2815,25 @@ class SurveyBot:
                                 "ACTION: click has neither element_id nor coordinates",
                                 extra={"stage": "Action"},
                             )
+                        if action_ok:
+                            try:
+                                post_checked = self._get_checked_count()
+                                post_next_btns = len(
+                                    self.driver.find_elements(
+                                        By.CSS_SELECTOR,
+                                        "[class*=next], [id*=next], "
+                                        "[class*=submit], [class*=pq]",
+                                    )
+                                )
+                                debug_log.info(
+                                    f"POST-CLICK | checked_radios="
+                                    f"{post_checked - (pre_checked or 0)} "
+                                    f"(pre={pre_checked} -> post={post_checked}) | "
+                                    f"next_buttons={post_next_btns}",
+                                    extra={"stage": "Action"},
+                                )
+                            except Exception:
+                                pass
                     elif act.action_type == "type":
                         if act.element_id is not None and act.value:
                             self.browser.type_into(
