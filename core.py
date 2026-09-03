@@ -965,31 +965,122 @@ class BrowserController:
 
         self.driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
 
+        # Diagnostic: report exactly what we're passing as arguments[0]
+        # before any dispatchEvent. If the next crash says dispatchEvent
+        # is not a function, this line tells us whether `el` is the
+        # WebElement we expect or something else (int, None, list…).
+        try:
+            self.driver.execute_script(
+                "window.__sentinelTypeArg = (function(a){"
+                "return {t: typeof a, c: (a && a.constructor) ? a.constructor.name : null,"
+                " v: (a === null) ? 'null' : (a === undefined) ? 'undefined' : "
+                "String(a).slice(0, 80), hasDispatch: (a && typeof a.dispatchEvent === 'function')};"
+                "})(arguments[0]);",
+                el,
+            )
+            probe = self.driver.execute_script(
+                "const r = window.__sentinelTypeArg; delete window.__sentinelTypeArg; return r;"
+            )
+            debug_log.info(
+                f"TYPE_INTO arg check | el.type={probe.get('t')} "
+                f"el.ctor={probe.get('c')} el.toString={probe.get('v')} "
+                f"el.hasDispatch={probe.get('hasDispatch')}",
+                extra={"stage": "Action"},
+            )
+            if not probe.get("hasDispatch"):
+                debug_log.error(
+                    f"TYPE_INTO abort | arguments[0] is {probe.get('t')} "
+                    f"({probe.get('c')}) value={probe.get('v')} — refusing to dispatch",
+                    extra={"stage": "Action"},
+                )
+                return False
+        except Exception as probe_err:
+            debug_log.warning(
+                f"TYPE_INTO probe failed: {probe_err}", extra={"stage": "Action"}
+            )
+
         if human_like:
             # Type character-by-character with JS dispatch for realism + framework compat
             for ch in text:
+                # Procedure 3: self-describing crash — the JS raises with
+                # the live typeof/ctor/value of arguments[0] so the next
+                # crash message *is* the diagnosis.
                 self.driver.execute_script(
-                    "arguments[0].value = arguments[0].value + arguments[1];"
+                    "const a = arguments[0];"
+                    "if (typeof a !== 'object' || a === null || "
+                    "typeof a.dispatchEvent !== 'function') {"
+                    "throw new Error("
+                    "'TYPE_INTO_ARG0_DIAG type=' + typeof a + "
+                    "' ctor=' + (a && a.constructor ? a.constructor.name : 'null') + "
+                    "' value=' + (a === null ? 'null' : String(a).slice(0, 80))"
+                    ");"
+                    "}"
+                    "a.value = a.value + arguments[1];"
                     "['input','change'].forEach(function(evtName) {"
                     "var evt = new Event(evtName, { bubbles: true });"
-                    "arguments[0].dispatchEvent(evt);"
+                    "a.dispatchEvent(evt);"
                     "});",
                     el, ch,
                 )
                 time.sleep(random.randint(30, 120) / 1000)
         else:
             # Fast path: set value + dispatch events in one script
+            # Procedure 3: self-describing crash wrapper
             self.driver.execute_script(
-                "arguments[0].value = arguments[1];"
+                "const a = arguments[0];"
+                "if (typeof a !== 'object' || a === null || "
+                "typeof a.dispatchEvent !== 'function') {"
+                "throw new Error("
+                "'TYPE_INTO_ARG0_DIAG type=' + typeof a + "
+                "' ctor=' + (a && a.constructor ? a.constructor.name : 'null') + "
+                "' value=' + (a === null ? 'null' : String(a).slice(0, 80))"
+                ");"
+                "}"
+                "a.value = arguments[1];"
                 "['input','change'].forEach(function(evtName) {"
                 "var evt = new Event(evtName, { bubbles: true });"
-                "arguments[0].dispatchEvent(evt);"
+                "a.dispatchEvent(evt);"
                 "});",
                 el, text,
             )
 
     def scroll_random(self):
         self.driver.execute_script(f"window.scrollBy(0, {random.randint(200, 600)});")
+
+    def select_option(self, element_id: int, value: str) -> bool:
+        """Select an option in a <select> element by value or visible text."""
+        sel = f"[data-bot-id='{element_id}']"
+        self._enter_active_frame(element_id)
+        try:
+            el = self.driver.find_element(By.CSS_SELECTOR, sel)
+            if el.tag_name.lower() != "select":
+                debug_log.warning(
+                    f"SELECT_OPTION | element_id={element_id} is "
+                    f"{el.tag_name}, not <select>",
+                    extra={"stage": "Action"},
+                )
+                return False
+            clicked = self.driver.execute_script(
+                "const el = arguments[0], val = arguments[1];"
+                "for (const opt of el.options) {"
+                "  if (opt.value === val || opt.text.trim() === val) {"
+                "    el.value = opt.value;"
+                "    el.dispatchEvent(new Event('change', {bubbles: true}));"
+                "    return true;"
+                "  }"
+                "}"
+                "return false;",
+                el, value,
+            )
+            return bool(clicked)
+        except (NoSuchElementException, StaleElementReferenceException, WebDriverException) as e:
+            debug_log.warning(
+                f"SELECT_OPTION failed ({e.__class__.__name__})",
+                extra={"stage": "Action"},
+            )
+            return False
+        finally:
+            self._reset_frame()
 
     def detect_captcha(self) -> Optional[str]:
         indicators = [
@@ -2896,10 +2987,41 @@ class SurveyBot:
                                 pass
                     elif act.action_type == "type":
                         if act.element_id is not None and act.value:
-                            self.browser.type_into(
-                                act.element_id, act.value
+                            action_ok = bool(
+                                self.browser.type_into(act.element_id, act.value)
                             )
-                            action_ok = True
+                            if not action_ok:
+                                debug_log.warning(
+                                    f"TYPE action refused by type_into | "
+                                    f"element_id={act.element_id}",
+                                    extra={"stage": "Action"},
+                                )
+                    elif act.action_type == "select_option":
+                        if act.element_id is not None and act.value:
+                            sel_elem = None
+                            for el in elements:
+                                if el.get("id") == act.element_id and el.get("tag") == "select":
+                                    sel_elem = el
+                                    break
+                            if sel_elem is not None:
+                                action_ok = self.browser.select_option(
+                                    act.element_id, act.value
+                                )
+                            else:
+                                # element_id not a <select> — try text match
+                                for el in elements:
+                                    if el.get("tag") == "select":
+                                        action_ok = self.browser.select_option(
+                                            el["id"], act.value
+                                        )
+                                        break
+                        elif act.coordinates:
+                            action_ok = self.browser.click_coords(*act.coordinates)
+                        else:
+                            debug_log.error(
+                                "ACTION: select_option has neither element_id nor coordinates",
+                                extra={"stage": "Action"},
+                            )
                     elif act.action_type == "select_multi":
                         if act.value:
                             for part in act.value.split(","):
