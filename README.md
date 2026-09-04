@@ -24,11 +24,9 @@ deterministic heuristic takes over when the provider is unavailable.
 
 | Path | What |
 |---|---|
-| `extension/` | MV3 Chrome extension: HUD, polling loop, element map, CDP "trusted" clicks, panel-hub stop |
+| `extension/` | MV3 Chrome extension: HUD, polling loop, element map, panel-hub stop |
 | `backend.py` | FastAPI server: `/decide` (LLM primary, heuristic fallback), `/learn`, `/status`, `/omni`, `/traces`, `/config/panel-hub` |
 | `sentinel_heuristic.py` | The one deterministic fallback + `real_input_kind()` element classifier |
-| `core.py` | Standalone Selenium bot (F12-driven) — the older headless-style loop |
-| `bot.py` | Standalone Selenium bot (CLI + `gui.py`) with CDP mouse controller |
 | `sentinel_traces.py` | Thread-safe trace bus, `/traces` poll endpoint, `omni_call()` wrapper |
 | `provider_health.py` | Cached `/models` health probe (30s cache, 5s timeout) |
 | `panel_config.py` | Panel-hub domain store + the shared host matcher |
@@ -37,9 +35,9 @@ deterministic heuristic takes over when the provider is unavailable.
 | `templates/trace.html` | Self-viewing HTML archive written per `/decide` call |
 | `examples/mock_form_bot.py` | Minimal form bot against the specimen |
 
-There are three bot loops because the project evolved; the extension +
-`backend.py` pair is the current product. `core.py` and `bot.py` are the
-standalone variants.
+The extension + `backend.py` pair is the current product. Standalone
+`core.py` / `bot.py` loops were removed in r30 to eliminate divergent
+behavior and dead dependencies.
 
 ## Element map schema
 
@@ -58,8 +56,8 @@ matcher/loop tests:
   …). Producers derive it from the associated control so a
   `<label><input type=radio></label>` reads as a radio.
 - Python readers go through `real_input_kind()`, which tolerates the
-  extension payload, the `core.py` map, and legacy shapes. If a producer
-  stops conforming, fix it there — not in three consumers.
+  extension payload and legacy shapes. If a producer stops conforming,
+  fix it there — not in multiple consumers.
 
 ## Install
 
@@ -90,10 +88,8 @@ copy .env.example .env
 - **Extension (current):** open a survey (e.g.
   `http://127.0.0.1:<port>/survey-test.html`), open the HUD (toolbar icon
   → Open HUD) and press **Start**. Content script injection is on demand:
-  the extension injects `content.js` into the tab when you start a run and
-  re-injects after hard navigations of the running tab.
-- **Standalone:** `python main.py` (`core.py` loop, F12 starts it on the
-  active tab) or `python run_gui.bat` / `gui.py` (`bot.py` with GUI).
+  the extension injects content scripts into the tab when you start a run
+  and re-injects after hard navigations of the running tab.
 - **Specimen smoke test:** `python smoke_survey_test.py`
   (needs `playwright` + `playwright install chromium`).
 
@@ -111,10 +107,9 @@ form you control.
   and warns loudly.
 - **Extension CSP** is `script-src 'self'` — no code is ever loaded from
   localhost; data flows over HTTP.
-- The extension holds `debugger` (CDP input) plus host permissions so it
-  can script-inject into the survey tab on demand. That is a real
-  privilege; keep the extension on a machine/profile where you'd rather
-  not have other extensions' bugs.
+- The extension holds host permissions so it can script-inject into
+  the survey tab on demand. That is a real privilege; keep the extension
+  on a machine/profile where you'd rather not have other extensions' bugs.
 - **Traces** (`SENTINEL_TRACES`, default `./traces`, gitignored) contain
   page text, the element map, and prompt material. They are pruned by age
   (`SENTINEL_TRACE_AGE_HOURS`, default 72h) *and* count (400). Treat the
@@ -140,10 +135,9 @@ the day they drift. CI runs all of them plus a full-bytecode compile
 
 ## Known sharp edges
 
-- `core.py` / `bot.py` and `extension/` + `backend.py` still each carry
-  their own bot loop; consolidating to one is the next big refactor.
-- `content.js` is 50 KB and was reviewed by the same person who wrote
-  it. The element collector and the panel-hub stop are the load-bearing
-  parts.
+- `content.js` is modular (state / fingerprint / element-map / actions /
+  nav) and shares one isolated world via manifest `content_scripts`.
+  The collector is role-based and pierces open shadow roots; closed
+  shadow roots stay invisible without CDP.
 - Heuristic confidence is a fixed 0.4 — "I am a dumb autofiller",
   honestly stated.

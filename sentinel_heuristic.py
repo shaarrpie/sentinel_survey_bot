@@ -15,9 +15,8 @@ see README "Element map schema"):
 - ``editable``   true for contenteditable nodes
 
 ``real_input_kind()`` is the single place that classifies an entry and is
-deliberately tolerant: it accepts the extension payload, the core.py map,
-and legacy shapes alike. If a producer stops conforming, break here, not in
-three consumers.
+deliberately tolerant: it accepts the extension payload and legacy shapes.
+If a producer stops conforming, break here, not in multiple consumers.
 """
 
 from __future__ import annotations

@@ -6,7 +6,7 @@ run, mirroring how Sentinel's two paths behave), and asserts:
   - zero console/page errors
   - trap image data-URI armed, 60-option dense list rendered
   - all 17 self-scoring checks pass on the DONE screen
-  - completion keywords match what core.py/content.js listen for
+  - completion keywords match what content.js listens for
   - DQ overlay toggles
 """
 import threading, functools
@@ -140,7 +140,7 @@ with sync_playwright() as pw:
 
     comp_keywords = ["thank you", "completed", "finished", "success",
                      "your responses have been recorded"]
-    check("completion detected like core.py/content.js",
+    check("completion detected like content.js",
           any(x in st["body"] for x in comp_keywords))
     check("DQ overlay toggles",
           page.evaluate("() => { document.querySelector('#dqBtn').click(); return document.querySelector('#dq').classList.contains('on'); }"))

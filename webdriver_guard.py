@@ -309,15 +309,6 @@ class SessionGuard:
 
         # Driver versions (read from local metadata, no driver round-trips)
         snap["versions"] = {}
-        for attr in ("selenium", "webdriver"):
-            ver = getattr(self.driver, attr + "_version", None) if self.driver else None
-            if ver:
-                snap["versions"][attr] = str(ver)
-        try:
-            import undetected_chromedriver as uc
-            snap["versions"]["uc"] = getattr(uc, "__version__", "unknown")
-        except Exception:
-            pass
         try:
             snap["versions"]["python"] = platform.python_version()
         except Exception:

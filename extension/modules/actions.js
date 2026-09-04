@@ -16,15 +16,6 @@ window.__sentinelModules = window.__sentinelModules || {};
         const tx = o.dx + rect.left + rect.width / 2;
         const ty = o.dy + rect.top + rect.height / 2;
 
-        const trusted = await new Promise(resolve => {
-            chrome.runtime.sendMessage({
-                action: 'TRUSTED_CLICK',
-                vp: { x: tx, y: ty, w: rect.width, h: rect.height }
-            }, resolve);
-        });
-
-        if (trusted && trusted.ok) return;
-
         const lx = rect.left + rect.width / 2, ly = rect.top + rect.height / 2;
         el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: lx, clientY: ly }));
         await sleep(50 + Math.random() * 100);
