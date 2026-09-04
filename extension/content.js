@@ -1,48 +1,20 @@
-// Sentinel Survey Bot — content script orchestrator (r30)
-// Loads modules in order, wires state, runs scan loop.
+// Sentinel Survey Bot — content script orchestrator (r31)
+// Modules are injected by manifest.json in dependency order:
+//   state.js -> fingerprint.js -> element-map.js -> actions.js -> nav.js -> content.js
+// They all share one isolated world; this file runs last.
 
-if (window.__sentinelContentLoaded) {
-    // already instrumented; skip everything below
-} else {
-window.__sentinelContentLoaded = true;
+(function() {
+    'use strict';
 
-// ── Load modules in dependency order ──────────────────────────────────
-const MODULES = [
-    'extension/modules/state.js',
-    'extension/modules/fingerprint.js',
-    'extension/modules/element-map.js',
-    'extension/modules/actions.js',
-    'extension/modules/nav.js'
-];
-
-function loadScript(src) {
-    return new Promise((resolve, reject) => {
-        const s = document.createElement('script');
-        s.src = src;
-        s.onload = resolve;
-        s.onerror = reject;
-        document.head.appendChild(s);
-    });
-}
-
-(async function init() {
-    try {
-        for (const src of MODULES) {
-            await loadScript(chrome.runtime.getURL(src));
-        }
-    } catch (e) {
-        console.error('[Sentinel] module load failed:', e);
-        return;
-    }
-
-    const { state } = window.__sentinelModules;
-    const { fingerprint } = window.__sentinelModules;
-    const { elementMap } = window.__sentinelModules;
-    const { actions } = window.__sentinelModules;
-    const { nav } = window.__sentinelModules;
+    // ── Module aliases ────────────────────────────────────────────────
+    const state = window.__sentinelModules.state;
+    const fingerprint = window.__sentinelModules.fingerprint;
+    const elementMap = window.__sentinelModules.elementMap;
+    const actions = window.__sentinelModules.actions;
+    const nav = window.__sentinelModules.nav;
     const S = state.S;
 
-    // ── Helpers wired to state ────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────
     const sleep = actions.sleep;
     const log = (kind, ...a) => {
         if (typeof kind !== 'string' || !['ok','ai','act','err','warn','dim','info'].includes(kind)) {
@@ -416,7 +388,7 @@ function loadScript(src) {
                 const myTab = sender.tab ? sender.tab.id : null;
                 scan(myTab);
             }
-            sendResponse({ status: 'started', build: 'r30' });
+            sendResponse({ status: 'started', build: 'r31' });
             return true;
         }
         else if (request.action === 'STOP') {
@@ -462,10 +434,7 @@ function loadScript(src) {
         }
     });
 
-    log('ok', '[+] content script live on ' + (location.host || 'about:blank') + ' (build r30, frame ' + (window === top ? 'top' : 'child') + ')');
+    log('ok', '[+] content script live on ' + (location.host || 'about:blank') + ' (build r31, frame ' + (window === top ? 'top' : 'child') + ')');
     log('[Sentinel] Content script loaded');
 
-} // end async init
-)(); // end IIFE
-
-} // end re-injection guard
+})();

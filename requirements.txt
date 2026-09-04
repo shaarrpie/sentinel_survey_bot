@@ -14,7 +14,4 @@ python-dotenv>=1.2,<2
 playwright>=1.62,<2
 imagehash>=4.3,<5
 numpy>=2.5,<3
-customtkinter>=6.0,<7
 pytesseract>=0.3.13,<0.4
-undetected-chromedriver>=3.5.5,<4
-selenium>=4.48,<5

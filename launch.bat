@@ -2,35 +2,30 @@
 chcp 65001 >nul
 title Sentinel Launcher
 echo ============================================
-echo   Sentinel Survey Bot - All-in-One Launcher
+echo   Sentinel Survey Bot - Backend Launcher
 echo ============================================
 echo.
 
 cd /d "%~dp0"
 
-echo [1/3] Starting Python backend...
+echo [1/2] Starting Python backend...
 start "Sentinel Backend" cmd /c "python backend.py"
 
-echo [2/3] Starting OmniRoute proxy...
+echo [2/2] Starting OmniRoute proxy...
 echo     (first run may take 60+ seconds to initialize)
 start "Sentinel OmniRoute" cmd /c "npx omniroute"
 
-echo [3/3] Waiting for services to be ready...
+echo.
+echo Waiting for services to be ready...
 call :wait_for http://127.0.0.1:8000/status 30 Backend
 call :wait_for http://localhost:20128/api/monitoring/health 90 OmniRoute
 
 echo.
-echo [+] Backend:  http://127.0.0.1:8000
+echo [+] Backend:   http://127.0.0.1:8000
 echo [+] OmniRoute: http://localhost:20128/v1
 echo.
-
-rem The old launcher ran bare "start chrome" — no extension loaded, and
-rem "close this window to stop" killed nothing. Now Chrome gets a dedicated
-rem profile + the extension, and both child processes are reaped on exit.
-set "CHROME_PROFILE=%TEMP%\sentinel_chrome_profile"
-echo Opening Chrome with the Sentinel extension (dedicated profile)...
-start "Sentinel Chrome" chrome --user-data-dir="%CHROME_PROFILE%" --load-extension="%~dp0extension" --new-window
-
+echo Open Chrome and load the extension from:
+echo   %~dp0extension
 echo.
 echo ============================================
 echo   All systems launched.
@@ -66,4 +61,4 @@ if %ELAPSED% geq %TIMEOUT% (
 )
 timeout /t %INTERVAL% /nobreak >nul
 set /a "ELAPSED+=INTERVAL"
-goto wait_loop
+goto wait_for

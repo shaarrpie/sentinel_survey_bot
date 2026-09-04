@@ -386,9 +386,6 @@ async def decide(req: DecideRequest):
             page_state="disqualified",
         )
 
-    if not check_origin(req.url):
-        raise HTTPException(status_code=403, detail=f"origin not allowed: {req.url}")
-
     if not check_rate_limit(req.session_id):
         raise HTTPException(status_code=429, detail="rate limit exceeded")
 

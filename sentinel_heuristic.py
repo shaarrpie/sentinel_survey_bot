@@ -5,10 +5,8 @@ see README "Element map schema"):
 
 - ``tag``        lowercase DOM tag (input, label, select, textarea, ...)
 - ``type``       semantic type. Producers emit the RAW html input type for
-                 inputs ("radio", "checkbox", "text", ...) — content.js
-                 derives it from the associated control, core.py from
-                 ``el.type``. Older copies of the docstring claimed a
-                 high-level "input" category; that was wrong and is retired.
+                 inputs ("radio", "checkbox", "text", ...) — the extension
+                 collector derives it from the associated control.
 - ``role``       ARIA role (radio/checkbox on div-based widgets)
 - ``input_type`` optional alias some producers emit for the raw type
 - ``checked``    bool, for radio/checkbox
@@ -39,10 +37,10 @@ TEXT_KINDS = {"text", "email", "tel", "number", "date", "datetime-local",
               "time", "month", "week", "password", "url", "search", "range"}
 
 DEFAULT_FILL_VALUES = {
-    "age": os.getenv("SENTINEL_FILL_AGE", "32"),
-    "postal": os.getenv("SENTINEL_FILL_POSTAL", "400001"),
-    "zip": os.getenv("SENTINEL_FILL_ZIP", "400001"),
-    "email": os.getenv("SENTINEL_FILL_EMAIL", "tester@example.com"),
+    "age": os.getenv("SENTINEL_FILL_AGE") or "32",
+    "postal": os.getenv("SENTINEL_FILL_POSTAL") or "400001",
+    "zip": os.getenv("SENTINEL_FILL_ZIP") or "400001",
+    "email": os.getenv("SENTINEL_FILL_EMAIL") or "tester@example.com",
 }
 
 

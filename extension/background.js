@@ -11,7 +11,6 @@ importScripts('hub_match.js');
 const MAX_LOGS = 200;
 let logs = [];              // [{t, line}] — newest last
 
-const lastPointer = new Map();
 const lastCaptureAt = new Map();   // windowId → ts (captureVisibleTab throttle)
 const perFrameMaps = new Map();    // tabId → Map<frameId, {elements, isTop, at}>
 
@@ -58,17 +57,6 @@ function createHud() {
     });
 }
 
-function cdp(tabId, params) {
-  return new Promise((resolve, reject) => {
-    chrome.debugger.sendCommand({ tabId },
-      'Input.dispatchMouseEvent', params, (result) => {
-        if (chrome.runtime.lastError)
-          reject(chrome.runtime.lastError);
-        else resolve(result);
-      });
-  });
-}
-
 function stitchFrameMaps(tabId) {
   const frames = perFrameMaps.get(tabId);
   if (!frames || frames.size === 0) return [];
@@ -79,81 +67,6 @@ function stitchFrameMaps(tabId) {
     }
   }
   return stitched;
-}
-
-function gauss(){ return (Math.random()+Math.random()+Math.random()-1.5)*2.4; }
-
-function bezierPath(sx, sy, tx, ty, n) {
-  const dx = tx - sx, dy = ty - sy;
-  const dist = Math.max(1, Math.hypot(dx, dy));
-  const px = -dy / dist, py = dx / dist;        // perpendicular unit
-  const b1 = (Math.random() * 0.17 + 0.08) * dist * (Math.random() < 0.5 ? -1 : 1);
-  const b2 = (Math.random() * 0.17 + 0.08) * dist * (Math.random() < 0.5 ? -1 : 1);
-  const p1x = sx + dx * 0.33 + px * b1, p1y = sy + dy * 0.33 + py * b1;
-  const p2x = sx + dx * 0.66 + px * b2, p2y = sy + dy * 0.66 + py * b2;
-  const pts = [];
-  for (let i = 1; i <= n; i++) {
-    const t = i / n;
-    const s = 10 * t ** 3 - 15 * t ** 4 + 6 * t ** 5;  // min-jerk ease
-    const u = 1 - s;
-    let x = u**3 * sx + 3 * u**2 * s * p1x + 3 * u * s**2 * p2x + s**3 * tx;
-    let y = u**3 * sy + 3 * u**2 * s * p1y + 3 * u * s**2 * p2y + s**3 * ty;
-    if (i < n) { x += gauss(); y += gauss(); }          // tremor mid-path only
-    pts.push({ x: Math.round(x), y: Math.round(y) });
-  }
-  return pts;   // last point is exactly (tx, ty) — press lands clean
-}
-
-// Never trust an in-memory Set across SW restarts: ask the browser whether
-// the tab is really attached right now (audit round one, A1/A2).
-function isDebuggerAttached(tabId) {
-  return new Promise((resolve) => {
-    chrome.debugger.getTargets((targets) => resolve(
-      Array.isArray(targets) &&
-      targets.some(t => t.tabId === tabId && t.attached)));
-  });
-}
-
-// Attach race: two concurrent TRUSTED_CLICKs for the same tab both
-// observed "not attached" and both called chrome.debugger.attach; the
-// second rejects (debugger busy) and that click silently failed. One
-// in-flight attach per tab; callers share the promise.
-const attachPromises = new Map();
-function ensureDebuggerAttached(tabId) {
-  if (!attachPromises.has(tabId)) {
-    attachPromises.set(tabId,
-      isDebuggerAttached(tabId).then((attached) => attached ? true :
-        new Promise((res, rej) => chrome.debugger.attach(
-          { tabId }, '1.3',
-          () => chrome.runtime.lastError
-            ? rej(chrome.runtime.lastError) : res(true))))
-        .finally(() => attachPromises.delete(tabId)));
-  }
-  return attachPromises.get(tabId);
-}
-
-async function trustedMouseClick(tabId, vp) {
-  try {
-    await ensureDebuggerAttached(tabId);
-    const tx = Math.round(vp.x + (Math.random() - 0.5) * vp.w * 0.64);
-    const ty = Math.round(vp.y + (Math.random() - 0.5) * vp.h * 0.64);
-    const start = lastPointer.get(tabId) ||
-      { x: 120 + Math.random() * 300, y: 120 + Math.random() * 200 };
-    const dist = Math.hypot(tx - start.x, ty - start.y);
-    const n = Math.max(18, Math.min(60, Math.round(dist / 14)));
-    const pts = bezierPath(start.x, start.y, tx, ty, n);
-    const per = Math.max(260, Math.min(1400, 320 + 2.2 * dist)) / n;
-    for (const p of pts) {
-      await cdp(tabId, { type: 'mouseMoved', x: p.x, y: p.y, button: 'none' });
-      await new Promise(r => setTimeout(r, per * (0.7 + Math.random() * 0.6)));
-    }
-    await new Promise(r => setTimeout(r, 40 + Math.random() * 80));
-    await cdp(tabId, { type: 'mousePressed', x: tx, y: ty, button: 'left', clickCount: 1 });
-    await new Promise(r => setTimeout(r, 60 + Math.random() * 80));
-    await cdp(tabId, { type: 'mouseReleased', x: tx, y: ty, button: 'left', clickCount: 1 });
-    lastPointer.set(tabId, { x: tx, y: ty });
-    return { ok: true };
-  } catch (err) { return { ok: false, error: String(err) }; }
 }
 
 async function fetchJson(url, options = {}, timeoutMs = 45000) {
@@ -259,12 +172,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       body: JSON.stringify({ memory: request.memory })
     }).catch(() => {});
     sendResponse({ ok: true });
-  }
-
-  if (request.action === 'TRUSTED_CLICK') {
-    const tabId = sender.tab ? sender.tab.id : null;
-    trustedMouseClick(tabId, request.vp).then(sendResponse);
-    return true;
   }
 
   if (request.action === 'REPORT_FRAME_MAP') {
@@ -510,12 +417,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 });
 
-chrome.debugger.onDetach.addListener((source) => {
-    // infobar "Cancel", tab crash, or devtools took over — forget stale memory
-    attachPromises.delete(source.tabId);
-    lastPointer.delete(source.tabId);
-});
-
 // Content scripts are injected on demand now (no <all_urls> manifest
 // entry), so a hard navigation on the run tab leaves it without the
 // listener that performs auto-resume. Re-inject when that tab finishes
@@ -564,7 +465,6 @@ chrome.commands.onCommand.addListener((command) => {
     });
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
-  lastPointer.delete(tabId);
   chrome.storage.session.get('runState', (result) => {
     const runState = (result && result.runState) || null;
     if (runState && runState.tabId === tabId) {
