@@ -1,170 +1,129 @@
-() => {
-    const question_data = {
-        QUESTION: "",
-        TYPE: "unknown",
-        OPTIONS: [],
-        RAW_TEXT: ""
-    };
+(() => {
+    const INTERACTIVE = 'button, input, select, textarea, a[href], [role], label, [contenteditable]';
 
-    const selectors = {
-        question: [
-            ".surveyQuestion .surveyQuestionText",
-            ".surveyQuestionText",
-            ".question-text",
-            ".questionText",
-            "[data-question-text]",
-            ".qtext",
-            ".question-title",
-            ".survey-title",
-            "h2.question",
-            "h3.question",
-            ".form-title",
-            ".field-label",
-            "label.question",
-            "[role='heading']",
-            ".ql-editor p",
-            ".question-header"
-        ],
-        options: [
-            ".surveyQuestionAnswer",
-            ".answer-option",
-            ".surveyAnswer",
-            ".option-label",
-            ".answerText",
-            "[data-answer]",
-            ".choice",
-            ".response",
-            "label.answer",
-            ".radio-label",
-            ".checkbox-label",
-            ".select-option",
-            ".dropdown-option",
-            ".multi-select-option",
-            ".single-select-option",
-            "input[type='radio']",
-            "input[type='checkbox']",
-            "select option",
-            ".form-check-label",
-            ".custom-control-label",
-            ".list-group-item",
-            ".option"
-        ],
-        questionContainer: [
-            ".surveyQuestion",
-            ".question-container",
-            ".survey-question",
-            ".quiz-question",
-            "[data-question]",
-            ".form-group",
-            ".field",
-            ".question",
-            ".survey-item",
-            ".form-field"
-        ]
-    };
-
-    let questionEl = null;
-    for (const sel of selectors.question) {
-        questionEl = document.querySelector(sel);
-        if (questionEl) break;
+    function accessibleName(el) {
+        const ids = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean);
+        if (ids.length) {
+            const parts = ids.map(i => {
+                const n = document.getElementById(i);
+                return n ? (n.innerText || n.textContent || '').trim() : '';
+            }).filter(Boolean);
+            if (parts.length) return parts.join(' ');
+        }
+        if (el.labels && el.labels.length) return el.labels[0].innerText.trim();
+        return (el.getAttribute('aria-label') || el.innerText || el.value || '').trim();
     }
 
-    if (questionEl) {
-        question_data.QUESTION = questionEl.innerText.trim();
-    } else {
-        const container = document.querySelector(selectors.questionContainer.join(", "));
-        if (container) {
-            const headings = container.querySelectorAll("h1, h2, h3, h4, h5, h6, .title, .header");
-            if (headings.length > 0) {
-                question_data.QUESTION = headings[0].innerText.trim();
-            } else {
-                const firstText = container.innerText.split("\n").find(line => line.trim().length > 10);
-                if (firstText) {
-                    question_data.QUESTION = firstText.trim();
-                }
+    function semanticType(el) {
+        const role = (el.getAttribute('role') || '').toLowerCase();
+        const tag = el.tagName.toLowerCase();
+        const type = (el.type || '').toLowerCase();
+
+        if (role === 'slider' || role === 'spinbutton') return 'range';
+        if (role === 'listbox' || role === 'combobox') return 'select';
+        if (role === 'switch') return 'checkbox';
+        if (role === 'radio' || type === 'radio') return 'radio';
+        if (role === 'checkbox' || type === 'checkbox') return 'checkbox';
+        if (role === 'textbox' || type === 'text' || type === 'email' || type === 'number' || type === 'tel' || type === 'date' || type === 'url' || tag === 'textarea') return 'text';
+        if (tag === 'select') return 'select';
+        if (tag === 'button') return 'button';
+        if (tag === 'a' && el.getAttribute('href')) return 'link';
+        if (el.isContentEditable) return 'text';
+        return 'unknown';
+    }
+
+    function isEffectivelyVisible(el) {
+        try {
+            if (el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return true;
+        } catch (e) {
+            const s = getComputedStyle(el);
+            if (s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0') return true;
+        }
+        // Include inputs hidden inside a visible <label> (custom radio/checkbox UIs)
+        const parentLabel = el.closest('label');
+        if (parentLabel) {
+            try {
+                if (parentLabel.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return true;
+            } catch (e) { }
+        }
+        return false;
+    }
+
+    function* walk(root, depth = 0) {
+        if (depth > 12) return;
+        try {
+            // First: walk ALL elements to discover shadow roots (shadow hosts
+            // are often non-interactive <div>s that wouldn't match INTERACTIVE).
+            const all = root.querySelectorAll('*');
+            for (const el of all) {
+                if (el.shadowRoot) yield* walk(el.shadowRoot, depth + 1);
+            }
+            // Then: yield the interactive elements themselves.
+            for (const el of root.querySelectorAll(INTERACTIVE)) {
+                yield el;
+            }
+        } catch (e) {
+            // cross-origin iframe: querySelectorAll throws, skip gracefully
+        }
+    }
+
+    const frameId = (function() {
+        try {
+            return window.frameElement ? window.frameElement.id || 'iframe-unknown' : 'top';
+        } catch (e) { return 'cross-origin'; }
+    })();
+
+    const elements = [];
+    const seen = new Set();
+    let nextId = 1;
+
+    for (const el of walk(document)) {
+        if (!isEffectivelyVisible(el)) continue;
+        const key = (el.tagName + '|' + (el.type || '') + '|' + (el.name || '') + '|' + (el.value || '') + '|' + accessibleName(el)).slice(0, 120);
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        const rect = el.getBoundingClientRect();
+        const entry = {
+            id: nextId++,
+            tag: el.tagName.toLowerCase(),
+            type: (el.type || el.getAttribute('type') || '').toLowerCase(),
+            role: (el.getAttribute('role') || '').toLowerCase(),
+            name: (el.name || '').toLowerCase(),
+            value: (el.value || '').toString().slice(0, 200),
+            text: accessibleName(el).slice(0, 200),
+            x: Math.round(rect.left + rect.width / 2),
+            y: Math.round(rect.top + rect.height / 2),
+            semanticType: semanticType(el),
+            accessibleName: accessibleName(el).slice(0, 200),
+            isVisible: true,
+            frameId: frameId,
+            options: []
+        };
+
+        if (el.tagName.toLowerCase() === 'select' && el.options) {
+            for (const opt of el.options) {
+                entry.options.push({
+                    value: (opt.value || '').toString(),
+                    text: (opt.text || '').trim().slice(0, 100)
+                });
             }
         }
+
+        elements.push(entry);
     }
 
-    if (!question_data.QUESTION) {
-        const bodyText = document.body.innerText.trim();
-        const lines = bodyText.split("\n").filter(l => l.trim().length > 5);
-        if (lines.length > 0) {
-            question_data.QUESTION = lines[0].trim();
-        }
-    }
+    const questionText = (function() {
+        const candidates = document.querySelectorAll('[role="heading"], h1, h2, h3, h4, .question-text, .surveyQuestionText, .qtext, .question-title');
+        if (candidates.length) return candidates[0].innerText.trim().slice(0, 500);
+        const found = document.body.innerText.trim().split('\n').find(l => l.trim().length > 10);
+        return found ? found.trim().slice(0, 500) : '';
+    })();
 
-    let optionElements = [];
-    for (const sel of selectors.options) {
-        optionElements = Array.from(document.querySelectorAll(sel));
-        if (optionElements.length > 0) break;
-    }
-
-    if (optionElements.length === 0) {
-        const container = document.querySelector(selectors.questionContainer.join(", ")) || document.body;
-        const labels = container.querySelectorAll("label");
-        if (labels.length > 1) {
-            optionElements = Array.from(labels);
-        }
-    }
-
-    const seenTexts = new Set();
-    optionElements.forEach((opt, idx) => {
-        let text = opt.innerText || opt.textContent || "";
-        text = text.trim();
-        if (opt.tagName === "INPUT") {
-            const label = opt.closest("label") || document.querySelector(`label[for='${opt.id}']`);
-            if (label) {
-                text = label.innerText.trim() || text;
-            }
-            if (!text) text = opt.value || opt.getAttribute("aria-label") || "";
-        }
-        if (opt.tagName === "OPTION") {
-            text = opt.text || opt.innerText || "";
-        }
-        text = text.trim();
-        if (text && !seenTexts.has(text.toLowerCase())) {
-            seenTexts.add(text.toLowerCase());
-            question_data.OPTIONS.push({
-                index: idx,
-                text: text,
-                value: opt.value || opt.getAttribute("value") || "",
-                tag: opt.tagName.toLowerCase(),
-                type: opt.type || opt.getAttribute("type") || ""
-            });
-        }
-    });
-
-    const hasRadio = optionElements.some(el =>
-        el.type === "radio" || el.getAttribute("role") === "radio"
-    );
-    const hasCheckbox = optionElements.some(el =>
-        el.type === "checkbox" || el.getAttribute("role") === "checkbox"
-    );
-    const hasSelect = optionElements.some(el =>
-        el.tagName === "SELECT" || el.classList.contains("select") ||
-        el.getAttribute("role") === "listbox" || el.getAttribute("role") === "combobox"
-    );
-    const hasTextbox = optionElements.some(el =>
-        el.tagName === "TEXTAREA" ||
-        (el.tagName === "INPUT" && ["text", "email", "number", "tel", "date", "url"].includes(el.type))
-    );
-
-    if (optionElements.length > 0 && optionElements[0].classList.contains("activeSelectMenu")) {
-        question_data.TYPE = "CHECKBOX";
-    } else if (hasCheckbox) {
-        question_data.TYPE = "CHECKBOX";
-    } else if (hasRadio) {
-        question_data.TYPE = "SELECT";
-    } else if (hasSelect) {
-        question_data.TYPE = "DROPDOWN";
-    } else if (hasTextbox) {
-        question_data.TYPE = "TEXT";
-    } else if (optionElements.length > 0) {
-        question_data.TYPE = "SELECT";
-    }
-
-    question_data.RAW_TEXT = document.body.innerText.trim().substring(0, 2000);
-
-    return question_data;
-}
+    return {
+        elements,
+        question: questionText,
+        rawText: document.body.innerText.trim().slice(0, 3000),
+        frameId
+    };
+})();

@@ -13,6 +13,7 @@ let logs = [];              // [{t, line}] — newest last
 
 const lastPointer = new Map();
 const lastCaptureAt = new Map();   // windowId → ts (captureVisibleTab throttle)
+const perFrameMaps = new Map();    // tabId → Map<frameId, {elements, isTop, at}>
 
 // MV3 evicts this service worker after ~30s idle while any debugger session
 // it opened survives — so the log buffer lives in session storage, not in
@@ -66,6 +67,18 @@ function cdp(tabId, params) {
         else resolve(result);
       });
   });
+}
+
+function stitchFrameMaps(tabId) {
+  const frames = perFrameMaps.get(tabId);
+  if (!frames || frames.size === 0) return [];
+  const stitched = [];
+  for (const [frameId, data] of frames) {
+    for (const el of (data.elements || [])) {
+      stitched.push({ ...el, frameId });
+    }
+  }
+  return stitched;
 }
 
 function gauss(){ return (Math.random()+Math.random()+Math.random()-1.5)*2.4; }
@@ -254,6 +267,89 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
+  if (request.action === 'REPORT_FRAME_MAP') {
+    const tabId = sender.tab ? sender.tab.id : null;
+    const frameId = request._frameId || (sender.frameId || 'unknown');
+    if (!perFrameMaps[tabId]) perFrameMaps[tabId] = new Map();
+    perFrameMaps[tabId].set(frameId, {
+      elements: request.elements || [],
+      frameId,
+      isTop: request._isTop || false,
+      at: Date.now()
+    });
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (request.action === 'SCAN_ALL_FRAMES') {
+    const tabId = sender.tab ? sender.tab.id : null;
+    if (!tabId) { sendResponse({ error: 'no tabId' }); return true; }
+    chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => {
+        try {
+          const FRAME = (function() {
+            try { return window === top ? 'top' : (window.frameElement ? ('frame-' + (window.frameElement.id || 'unknown')) : 'frame-unknown'); }
+            catch (e) { return 'cross-origin'; }
+          })();
+          window.__sentinelGetLocalMap = window.__sentinelGetLocalMap || function() {
+            const out = [];
+            const view = document.defaultView;
+            const nodes = document.querySelectorAll(
+              'button, input, select, textarea, a, [role="button"], [role="radio"], ' +
+              '[role="checkbox"], [role="slider"], label, [contenteditable]'
+            );
+            for (const el of nodes) {
+              try {
+                const cs = view.getComputedStyle(el);
+                if (cs.display === 'none' || cs.visibility === 'hidden' || Number.parseFloat(cs.opacity) === 0) continue;
+                const rect = el.getBoundingClientRect();
+                if (rect.width < 5 || rect.height < 5) continue;
+                const semanticType = (el.type || el.getAttribute('role') || el.tagName.toLowerCase());
+                out.push({
+                  tag: el.tagName.toLowerCase(),
+                  type: (el.type || '').toLowerCase(),
+                  role: (el.getAttribute('role') || '').toLowerCase(),
+                  name: (el.name || '').toLowerCase(),
+                  value: (el.value || '').toString().slice(0, 200),
+                  text: (el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim().slice(0, 200),
+                  x: Math.round(rect.left + rect.width / 2),
+                  y: Math.round(rect.top + rect.height / 2),
+                  semanticType,
+                  accessibleName: (el.getAttribute('aria-label') || el.innerText || '').trim().slice(0, 200),
+                  frameId: FRAME
+                });
+              } catch (e) {}
+            }
+            return out;
+          };
+          return { frameId: FRAME, elements: window.__sentinelGetLocalMap() };
+        } catch (e) {
+          return { frameId: 'error', elements: [], error: e.message };
+        }
+      }
+    }).then((results) => {
+      const tabId2 = tabId;
+      const stitched = [];
+      for (const result of (results || [])) {
+        if (result && result.frameId && Array.isArray(result.elements)) {
+          for (const el of result.elements) {
+            stitched.push({ ...el, frameId: result.frameId });
+          }
+          perFrameMaps[tabId2] = perFrameMaps[tabId2] || new Map();
+          perFrameMaps[tabId2].set(result.frameId, {
+            elements: result.elements,
+            frameId: result.frameId,
+            isTop: result.frameId === 'top',
+            at: Date.now()
+          });
+        }
+      }
+      sendResponse({ ok: true, stitched, frameCount: (results || []).length });
+    }).catch((e) => sendResponse({ error: e.message }));
+    return true;
+  }
+
   if (request.action === 'SET_RUN_STATE') {
     chrome.storage.session.set({
       runState: {
@@ -433,7 +529,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
       if (chrome.runtime.lastError || !tab ||
           !/^https?:/.test(tab.url || '')) return;
       chrome.scripting.executeScript({
-        target: { tabId },
+        target: { tabId, allFrames: true },
         files: ['content.js']
       }).catch((e) => {
         logs.push({ t: Date.now(),

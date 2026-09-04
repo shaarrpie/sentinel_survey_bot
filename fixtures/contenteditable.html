@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Contenteditable</title></head>
+<body>
+<h2>Describe your experience</h2>
+<div id="editor" contenteditable="true" style="border:1px solid #ccc; padding:8px; min-height:60px;">
+  <p>Start typing here...</p>
+</div>
+<button id="save">Save</button>
+<script>
+  document.getElementById('save').addEventListener('click', () => {
+    alert('Saved: ' + document.getElementById('editor').innerText);
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Virtualized List</title></head>
+<body>
+<h2>Select all that apply (virtualized)</h2>
+<div id="list-container" style="height:200px; overflow:auto; position:relative;"></div>
+<p id="selected-count">Selected: 0</p>
+<script>
+  const TOTAL = 200;
+  const container = document.getElementById('list-container');
+  let selected = new Set();
+  function render(offset = 0) {
+    container.innerHTML = '';
+    const frag = document.createDocumentFragment();
+    for (let i = 0; i < 20; i++) {
+      const idx = offset + i;
+      if (idx >= TOTAL) break;
+      const label = document.createElement('label');
+      label.style.display = 'block';
+      label.innerHTML = `<input type="checkbox" data-sid="${idx}" value="item-${idx}"> Item ${idx}`;
+      const cb = label.querySelector('input');
+      cb.addEventListener('change', () => {
+        if (cb.checked) selected.add(idx); else selected.delete(idx);
+        document.getElementById('selected-count').textContent = 'Selected: ' + selected.size;
+      });
+      frag.appendChild(label);
+    }
+    container.appendChild(frag);
+  }
+  render(0);
+  container.addEventListener('scroll', () => render(Math.floor(container.scrollTop / 28) * 20));
+</script>
+</body>
+</html>

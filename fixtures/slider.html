@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Slider Widget</title></head>
+<body>
+<h2>Adjust the volume</h2>
+<div role="slider" id="volume" aria-label="Volume control" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50" tabindex="0" style="width:300px;height:20px;background:#ccc;"></div>
+<p id="slider-value">Current: 50</p>
+<script>
+  const slider = document.getElementById('volume');
+  slider.addEventListener('keydown', e => {
+    let v = parseInt(slider.getAttribute('aria-valuenow'));
+    if (e.key === 'ArrowRight') v = Math.min(100, v + 5);
+    if (e.key === 'ArrowLeft') v = Math.max(0, v - 5);
+    slider.setAttribute('aria-valuenow', v);
+    document.getElementById('slider-value').textContent = 'Current: ' + v;
+  });
+</script>
+</body>
+</html>

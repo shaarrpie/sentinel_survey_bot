@@ -11,6 +11,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -28,7 +29,12 @@ from PIL import Image
 
 # Local module now that the backend/ package name collision is gone.
 # No guard: if this import fails, the server is broken and should say so.
-from sentinel_heuristic import heuristic_decide, real_input_kind
+from sentinel_heuristic import (
+    heuristic_decide,
+    heuristic_preanswer,
+    detect_captcha,
+    real_input_kind,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +53,40 @@ provider_health = ProviderHealth(
     api_key=API_KEY,
     model=MODEL_NAME,
 )
+
+# ── hardening: keyring, rate limit, origin whitelist ──────────────────
+
+def get_api_key() -> str:
+    try:
+        import keyring
+        key = keyring.get_password("sentinel_survey_bot", "api_key")
+        if key:
+            return key
+    except Exception:
+        pass
+    return API_KEY
+
+RATE_LIMIT_STORE = defaultdict(list)
+RATE_LIMIT_MAX = int(os.getenv("SENTINEL_RATE_LIMIT_MAX", "10"))
+RATE_LIMIT_WINDOW = int(os.getenv("SENTINEL_RATE_LIMIT_WINDOW", "60"))
+
+def check_rate_limit(session_id: str) -> bool:
+    now = time.time()
+    window = RATE_LIMIT_STORE[session_id]
+    window[:] = [t for t in window if now - t < RATE_LIMIT_WINDOW]
+    if len(window) >= RATE_LIMIT_MAX:
+        return False
+    window.append(now)
+    return True
+
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("SENTINEL_ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+
+def check_origin(url: str) -> bool:
+    if "*" in ALLOWED_ORIGINS:
+        return True
+    return any(url.startswith(o) for o in ALLOWED_ORIGINS)
+
+CONFIRMATION_GATE = os.getenv("SENTINEL_CONFIRMATION_GATE", "0") == "1"
 
 
 @asynccontextmanager
@@ -212,6 +252,7 @@ class SurveyDecision(BaseModel):
     actions: List[Action]
     memory_note: Optional[str] = None
     source: Optional[str] = None   # llm-structured | llm-raw | heuristic (r29)
+    page_state: Optional[Literal["normal", "completed", "disqualified", "captcha"]] = None
 
 # ── persona / memory / rules (unchanged) ─────────────────────────
 
@@ -291,15 +332,16 @@ def _heuristic_or_stop(rec, req, session_id, t0, cycle, reason):
             source="heuristic",
         )
         return _finish(rec, req, session_id, decision, t0, path="heuristic")
-    decision = SurveyDecision(
-        page_summary=f"heuristic: {reason}, no actions",
-        question_type="completion",
-        confidence=0.2,
-        actions=[],
-        memory_note=f"provider_down: {reason}",
-        source="heuristic",
-    )
-    return _finish(rec, req, session_id, decision, t0, path="heuristic")
+        decision = SurveyDecision(
+            page_summary=f"heuristic: {reason}, no actions",
+            question_type="completion",
+            confidence=0.2,
+            actions=[],
+            memory_note=f"provider_down: {reason}",
+            source="heuristic",
+            page_state="normal",
+        )
+        return _finish(rec, req, session_id, decision, t0, path="heuristic")
 
 
 
@@ -340,7 +382,14 @@ async def decide(req: DecideRequest):
             confidence=1.0,
             actions=[],
             memory_note="panel_hub_stop",
+            page_state="disqualified",
         )
+
+    if not check_origin(req.url):
+        raise HTTPException(status_code=403, detail=f"origin not allowed: {req.url}")
+
+    if not check_rate_limit(req.session_id):
+        raise HTTPException(status_code=429, detail="rate limit exceeded")
 
     _prune_sessions()
     session_id = req.session_id
@@ -468,11 +517,78 @@ async def decide(req: DecideRequest):
     if img_text:
         req.page_text += f"\n[IMAGE TEXT: {img_text}]"
 
-    # ── iframe hint: if page has iframe, add instructions to prompt ──
-    # (content.js marks in-iframe entries with a truthy `frame`; there is
-    # no `self` here — this used to be a silent paste from core.py.)
+    # ── heuristic pre-answer: deterministic fields are answered here ──
+    # The LLM only sees judgment-needing elements, which is cheaper and
+    # avoids the truncation cliff (req.elements[:80]).
+    pre = heuristic_preanswer(req.elements, req.page_text)
+    heuristic_actions = pre["actions"]
+    remaining_elements = pre["remaining"]
+
+    # ── page_state detection (demotes to heuristic fallback if bad state) ──
+    page_state = "normal"
+    lower_url = req.url.lower()
+    lower_text = req.page_text.lower()
+    if is_panel_hub(req.url):
+        page_state = "disqualified"
+    elif any(k in lower_text for k in ("disqualified", "screened out", "screenout",
+                                         "do not qualify", "does not qualify", "quota full",
+                                         "quota is full", "reward=0", "terminated")):
+        page_state = "disqualified"
+    elif any(k in lower_text for k in ("thank you", "your responses have been recorded",
+                                        "gracias por completar", "completed", "finished")):
+        page_state = "completed"
+    elif any(e.get("tag") == "iframe" and "recaptcha" in (e.get("src") or "").lower()
+             for e in req.elements):
+        page_state = "captcha"
+    elif detect_captcha(req.page_text):
+        page_state = "captcha"
+
+    if page_state == "completed":
+        return SurveyDecision(
+            page_summary="Page state: completed",
+            question_type="completion",
+            confidence=1.0,
+            actions=[],
+            memory_note="page_state_completed",
+            source="heuristic",
+            page_state=page_state,
+        )
+    if page_state == "disqualified":
+        return SurveyDecision(
+            page_summary="Page state: disqualified",
+            question_type="completion",
+            confidence=1.0,
+            actions=[],
+            memory_note="page_state_disqualified",
+            source="heuristic",
+            page_state=page_state,
+        )
+    if page_state == "captcha":
+        return SurveyDecision(
+            page_summary="Page state: captcha detected",
+            question_type="completion",
+            confidence=1.0,
+            actions=[Action(action_type="human_help", reasoning="CAPTCHA detected")],
+            memory_note="page_state_captcha",
+            source="heuristic",
+            page_state=page_state,
+        )
+
+    # If heuristic pre-answered everything, skip the LLM entirely
+    if not remaining_elements and heuristic_actions:
+        return SurveyDecision(
+            page_summary=f"heuristic pre-answered {len(heuristic_actions)} deterministic action(s)",
+            question_type="mixed",
+            confidence=0.5,
+            actions=[Action(**a) for a in heuristic_actions],
+            memory_note=None,
+            source="heuristic",
+            page_state=page_state,
+        )
+
+    # ── iframe hint ──
     iframe_hint = ""
-    if any(e.get("frame") for e in req.elements):
+    if any(e.get("frame") for e in remaining_elements):
         iframe_hint = ("\nNOTE: Some elements are inside an iframe (they carry a "
                        "frame flag). Answer the main page first, then the iframe's question.")
 
@@ -482,22 +598,31 @@ async def decide(req: DecideRequest):
         rules_block = ("\n".join(f"- {r}" for r in LEARNED_RULES)
                        if LEARNED_RULES else "None yet.")
 
-    prompt = f"""You are a survey completion assistant. Answer EVERY visible unanswered question on this page in a SINGLE response.
+    # Chunk remaining elements if still over budget (multiple /decide calls
+    # instead of one amputated one — cheaper and correct).
+    llm_elements = remaining_elements
+    if len(llm_elements) > MAX_ELEMENTS:
+        llm_elements = llm_elements[:MAX_ELEMENTS]
+
+    prompt = f"""You are a survey completion assistant. These are the ONLY elements that need your judgment — deterministic fields (obvious radios, empty selects, empty text inputs) have already been answered by a heuristic engine.
 
 Rules:
-- Return actions for ALL questions you can see, not just one.
-- Use click for radio/checkbox/button, type for text inputs, select_option for dropdowns, next to advance.
+- Answer ONLY the elements listed below. Do NOT re-answer fields the heuristic already handled.
+- Use click for radio/checkbox/button, type for text inputs, select_option for dropdowns.
 - For radios, pick the best option per group. For checkboxes, select all that apply unless "none" is appropriate.
+- To advance: click the advance/submit button directly. NEVER emit a "next" action.
+- If the page appears fully answered and you see an advance button, click it directly.
 - Do not ask for clarification or request more info.
 - Return JSON matching the SurveyDecision schema.
 
+Page state: {page_state}
 URL: {req.url}
 Page text: {req.page_text[:3000]}
-Elements: {json.dumps(req.elements[:80])}
+Elements: {json.dumps(llm_elements)}
 Memory: {memory_block}
 Rules: {rules_block}{iframe_hint}
 
-Return JSON matching the SurveyDecision schema with actions for ALL visible questions."""
+Return JSON matching the SurveyDecision schema with actions for ONLY the judgment-needing elements above."""
 
     rec["prompt"] = prompt
     with _state_lock:
@@ -588,6 +713,17 @@ Return JSON matching the SurveyDecision schema with actions for ALL visible ques
                   + ", ".join(f"{a.action_type}:{a.element_id}"
                               for a in decision.actions))
 
+        # Combine heuristic pre-answers with LLM judgment actions
+        combined_actions = list(heuristic_actions) + [a.model_dump() for a in decision.actions]
+        decision = decision.model_copy(update={
+            "actions": [Action(**a) for a in combined_actions],
+            "page_state": page_state,
+        })
+        if heuristic_actions:
+            decision = decision.model_copy(update={
+                "page_summary": decision.page_summary + f" (+ {len(heuristic_actions)} heuristic)"
+            })
+
         rec["snap_b64"] = (screenshot_b64[:SNAP_MAX]
                            + ("__TRUNC__" if SNAP_MAX and len(screenshot_b64) > SNAP_MAX else "")) \
             if SNAP_MAX else screenshot_b64
@@ -604,23 +740,22 @@ Return JSON matching the SurveyDecision schema with actions for ALL visible ques
                    f"cycle {cycle}: LLM timeout — heuristic fallback",
                    {"cycle": cycle, "err": str(e)[:300]}, level="warn")
         try:
-            heuristic = heuristic_decide(req.elements, req.page_text)
+            pre = heuristic_preanswer(req.elements, req.page_text)
+            heuristic_actions = pre["actions"]
         except Exception:
-            logger.warning("[heuristic] heuristic_decide raised during timeout fallback",
+            logger.warning("[heuristic] heuristic_preanswer raised during timeout fallback",
                            exc_info=True)
-            heuristic = None
-        if heuristic and heuristic.get("actions"):
+            heuristic_actions = []
+        if heuristic_actions:
             return _finish(rec, req, session_id, SurveyDecision(
-                page_summary=heuristic.get("page_summary", "heuristic"),
-                question_type=heuristic.get("question_type", "unknown"),
-                confidence=heuristic.get("confidence", 0.2),
-                actions=heuristic["actions"],
-                memory_note=heuristic.get("memory_note"),
+                page_summary=f"heuristic pre-answered {len(heuristic_actions)} action(s) after timeout",
+                question_type="mixed",
+                confidence=0.4,
+                actions=[Action(**a) for a in heuristic_actions],
+                memory_note="timeout_heuristic_preanswer",
                 source="heuristic",
+                page_state=page_state,
             ), t0, path="heuristic")
-        # "navigation" is a member of SurveyDecision.question_type — this
-        # used to raise a ValidationError *inside the except handler* and
-        # turn the one graceful-degradation path into an HTTP 500.
         decision = SurveyDecision(
             page_summary="heuristic: timeout, no actions",
             question_type="navigation",
@@ -628,6 +763,7 @@ Return JSON matching the SurveyDecision schema with actions for ALL visible ques
             actions=[Action(action_type="next", reasoning="llm timeout — navigate")],
             memory_note="timeout_no_actions",
             source="heuristic",
+            page_state=page_state,
         )
         return _finish(rec, req, session_id, decision, t0, path="heuristic")
     except Exception as e:

@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Shadow DOM Radio</title></head>
+<body>
+<h2>What is your favorite color?</h2>
+<div id="shadow-host">
+  <p>Shadow DOM radios below — top-level querySelector cannot see these.</p>
+</div>
+<script>
+  const host = document.getElementById('shadow-host');
+  const shadow = host.attachShadow({mode: 'open'});
+  shadow.innerHTML = `
+    <div class="question">
+      <p>Pick a color (inside shadow root):</p>
+      <label><input type="radio" name="color" value="red"> Red</label><br>
+      <label><input type="radio" name="color" value="green"> Green</label><br>
+      <label><input type="radio" name="color" value="blue"> Blue</label>
+    </div>
+  `;
+</script>
+</body>
+</html>

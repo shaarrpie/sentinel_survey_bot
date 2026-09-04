@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Cross-Origin Iframe</title></head>
+<body>
+<h2>Parent page</h2>
+<iframe id="remote" src="http://localhost:20129/frame-survey.html" width="100%" height="200"></iframe>
+<script>
+  window.addEventListener('message', e => {
+    if (e.data && e.data.type === 'survey-answer') {
+      document.getElementById('status').textContent = 'Iframe answered: ' + e.data.value;
+    }
+  });
+</script>
+<p id="status">Waiting for iframe...</p>
+</body>
+</html>

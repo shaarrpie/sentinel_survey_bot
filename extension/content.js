@@ -9,6 +9,23 @@ window.__sentinelContentLoaded = true;
 const SCAN_INTERVAL = 15000;
 let lastScanAt = 0;
 
+// Per-frame identity: sender.frameId is supplied by Chrome and is stable
+// across navigations within the same frame. Use it to tag every outgoing
+// message so the background can stitch per-frame maps without offset math.
+function frameIdentity() {
+    try {
+        if (window === top) return { frameId: 'top', isTop: true };
+        const fe = window.frameElement;
+        return { frameId: fe ? ('frame-' + (fe.id || fe.src.slice(-16))) : 'frame-unknown', isTop: false };
+    } catch (e) {
+        return { frameId: 'cross-origin', isTop: false };
+    }
+}
+const FRAME = frameIdentity();
+function tagged(request) {
+    return { ...request, _frameId: FRAME.frameId, _isTop: FRAME.isTop };
+}
+
 // Every log line carries an explicit severity tag so the popup never has to
 // regex-sniff its own output (audit round one, section B). An untagged first
 // argument degrades gracefully to a plain info line.
@@ -20,7 +37,7 @@ function log(kind, ...a) {
     }
     try {
         chrome.runtime.sendMessage(
-            { action: 'LOG', line: a.map(String).join(' '), kind },
+            tagged({ action: 'LOG', line: a.map(String).join(' '), kind }),
             () => void chrome.runtime.lastError
         );
     } catch (e) {}
@@ -299,7 +316,8 @@ function collectDocumentElements(doc, offset, frame, elements, census) {
           stateEl.getAttribute('aria-disabled') === 'true',
         x: Math.round(offset.left + rect.left + rect.width / 2),
         y: Math.round(offset.top + rect.top + rect.height / 2),
-        context: questionContext(el)
+        context: questionContext(el),
+        frameId: FRAME.frameId
       };
 
       if (semanticType === 'radio' || semanticType === 'checkbox') {
@@ -415,14 +433,28 @@ function isSrOnlyControl(el) {
 function getFingerprint() {
     const parts = [location.href];
     const hashDoc = (doc, prefix) => {
-        const dom = doc.querySelectorAll(
-            'button, input, select, textarea, a, label, [contenteditable]');
-        for (const el of dom) {
-            if (el.tagName === 'INPUT' && el.type === 'hidden') continue;
-            const ce = el.isContentEditable ? (el.textContent || '').slice(0, 20) : '';
-            parts.push(prefix + el.tagName + ':' + (el.getAttribute('name') || '') + ':'
-                       + (el.id || '') + ':' + (el.checked ? 1 : 0) + ':'
-                       + (el.value || '').slice(0, 20) + ':' + ce);
+        const groups = new Map();
+        for (const el of doc.querySelectorAll(
+            'input[type="radio"], input[type="checkbox"], input[type="text"], input[type="email"], input[type="number"], input[type="tel"], input[type="date"], select, textarea, [contenteditable]'
+        )) {
+            if (el.type === 'hidden') continue;
+            const key = el.getAttribute('name') || el.id || el.tagName.toLowerCase();
+            const kind = el.type || el.tagName.toLowerCase();
+            const val = el.isContentEditable ? (el.textContent || '').slice(0, 20) :
+                (el.value || '').slice(0, 20);
+            const checked = (el.type === 'radio' || el.type === 'checkbox')
+                ? (el.checked ? '1' : '0') : '';
+            const existing = groups.get(key);
+            if (existing) {
+                existing.kind = kind;
+                existing.val = val;
+                existing.checked = checked;
+            } else {
+                groups.set(key, { kind, val, checked });
+            }
+        }
+        for (const [key, info] of groups) {
+            parts.push(prefix + key + ':' + info.kind + ':' + info.checked + ':' + info.val);
         }
     };
     hashDoc(document, '');
@@ -523,8 +555,6 @@ async function humanClick(el) {
 
 async function humanType(el, text) {
     if (!el.isConnected) return;
-    // Label pseudo-targets: resolve to their real control before writing,
-    // or the write dies silently on the tagName guard below (r13).
     if (el.tagName === 'LABEL') {
         const ctrl = el.control ||
             el.querySelector('input, textarea');
@@ -532,10 +562,9 @@ async function humanType(el, text) {
     }
     if (el.isContentEditable) {
         el.focus();
+        el.textContent = '';
         for (const ch of text) {
-            el.textContent += ch;
-            el.dispatchEvent(new InputEvent('input',
-                { bubbles: true, data: ch, inputType: 'insertText' }));
+            document.execCommand('insertText', false, ch);
             await sleep(30 + Math.random() * 90);
         }
         el.dispatchEvent(new Event('change', { bubbles: true }));
@@ -570,9 +599,7 @@ async function doType(el, value) {
         el.focus();
         el.textContent = '';
         for (const ch of value) {
-            el.textContent += ch;
-            el.dispatchEvent(new InputEvent('input',
-                { bubbles: true, data: ch, inputType: 'insertText' }));
+            document.execCommand('insertText', false, ch);
             await sleep(30 + Math.random() * 90);
         }
         el.dispatchEvent(new Event('change', { bubbles: true }));
@@ -611,7 +638,7 @@ async function settleAndVerify(el, snap) {
 // same-origin iframes are invisible to top-document querySelector, so the
 // remap must search those docs too (round nine artifact: "Re-resolve
 // failed for ng" while the node sat in a registered iframe).
-function findNodeBySid(sid) {
+function findNodeBySid(sid, snap) {
     let el = null;
     try { el = document.querySelector(`[data-sentinel-sid="${sid}"]`); }
     catch (e) {}
@@ -623,6 +650,25 @@ function findNodeBySid(sid) {
             el = d.querySelector(`[data-sentinel-sid="${sid}"]`);
             if (el) return el;
         } catch (e) {}   // cross-origin — unreachable by design
+    }
+    // Virtualized remount: sid not found → fuzzy-match by semanticType + accessibleName
+    if (snap && snap.text) {
+        const candidates = [];
+        try {
+            for (const f of [document, ...document.querySelectorAll('iframe').map(i => {
+                try { return i.contentDocument; } catch (e) { return null; }
+            }).filter(Boolean)]) {
+                for (const node of f.querySelectorAll('input, select, textarea, button, [contenteditable], label')) {
+                    const text = (node.innerText || node.textContent || node.getAttribute('aria-label') || '').trim().toLowerCase();
+                    const type = (node.type || node.getAttribute('role') || node.tagName.toLowerCase());
+                    if (text.includes(snap.text.toLowerCase().slice(0, 30)) ||
+                        (snap.semanticType && type === snap.semanticType)) {
+                        candidates.push(node);
+                    }
+                }
+            }
+        } catch (e) {}
+        if (candidates.length === 1) return candidates[0];
     }
     return null;
 }
@@ -671,7 +717,7 @@ async function executeAction(action, elements) {
                 return;
             }
             // Remap + re-resolve by STABLE handle, not array slot
-            const fresh = findNodeBySid(sid);
+            const fresh = findNodeBySid(sid, snap);
             if (!fresh) { log('err', 'Re-resolve failed for', sid); return; }
             log('act', 'Re-resolved by stable sid', sid);
             el = fresh;
@@ -719,7 +765,7 @@ async function executeAction(action, elements) {
                     `${el.readOnly ? ' READONLY' : ''}${el.disabled ? ' DISABLED' : ''}`);
                 return;
             }
-            const fresh = findNodeBySid(sid);
+            const fresh = findNodeBySid(sid, snap);
             if (!fresh) { log('err', 'Re-resolve failed for', sid); return; }
             log('act', 'Re-resolved by stable sid', sid);
             el = fresh;
@@ -922,11 +968,23 @@ async function scan(tabId) {
             markStopped();
             return;
         }
-        if (isComplete()) {
-            log('ok', '[+] Completed');
-            markStopped();
-            return;
+    const CONF_GATE = (() => {
+        try { return localStorage.getItem('__sentinelConfirmGate') === '1'; }
+        catch (e) { return false; }
+    })();
+
+    if (isComplete()) {
+        if (CONF_GATE) {
+            const ok = confirm('Survey appears complete.\n\nPress OK to confirm submission, or Cancel to continue.');
+            if (!ok) {
+                log('warn', 'Confirmation gate: user declined completion');
+                return;
+            }
         }
+        log('ok', '[+] Completed');
+        markStopped();
+        return;
+    }
         if (detectCaptcha()) {
             log('err', '[!] CAPTCHA detected — pausing');
             alert('CAPTCHA detected. Solve it manually, then click Start.');

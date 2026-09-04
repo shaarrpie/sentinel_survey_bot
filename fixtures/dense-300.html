@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>300-Question Dense Page</title></head>
+<body>
+<h1>Survey (300 questions)</h1>
+<div id="questions"></div>
+<script>
+  const container = document.getElementById('questions');
+  for (let i = 1; i <= 300; i++) {
+    const q = document.createElement('div');
+    q.className = 'question';
+    q.innerHTML = `<p><strong>Q${i}.</strong> Choose an option</p>
+      <label><input type="radio" name="q${i}" value="a"> A</label>
+      <label><input type="radio" name="q${i}" value="b"> B</label>
+      <label><input type="radio" name="q${i}" value="c"> C</label>`;
+    container.appendChild(q);
+  }
+</script>
+</body>
+</html>

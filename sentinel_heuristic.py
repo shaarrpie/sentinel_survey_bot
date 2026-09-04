@@ -24,6 +24,8 @@ three consumers.
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from collections import defaultdict
 from typing import Any
 
@@ -34,6 +36,38 @@ NONE_WORDS = {"none", "none of the above", "no", "neither", "not applicable",
 NON_TEXT_INPUTS = {"hidden", "button", "submit", "reset", "image", "file"}
 TEXT_KINDS = {"text", "email", "tel", "number", "date", "datetime-local",
               "time", "month", "week", "password", "url", "search", "range"}
+
+
+def _norm(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s or "").lower()
+    s = re.sub(r"\bto\b", "-", s)
+    s = re.sub(r"[^\w\s]", "", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _levenshtein(a: str, b: str) -> int:
+    if len(a) < len(b):
+        return _levenshtein(b, a)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i]
+        for j, cb in enumerate(b, 1):
+            curr.append(min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = curr
+    return prev[-1]
+
+
+def match_option(el: dict, want: str) -> Any | None:
+    wn = _norm(want)
+    best, best_d = None, 999
+    for o in el.get("options", []):
+        for cand in (o.get("text", ""), str(o.get("value", ""))):
+            d = _levenshtein(_norm(cand), wn)
+            if d < best_d:
+                best, best_d = o, d
+    return best if best_d <= 3 else None
 
 
 def real_input_kind(element: dict[str, Any]) -> str:
@@ -183,14 +217,16 @@ def heuristic_decide(elements: list[dict[str, Any]], page_text: str = "") -> dic
         if kind == "select":
             if str(element.get("value") or "").strip():
                 continue
-            options = normalized_options(element)
-            if options:
-                pick = options[0]
+            pick = match_option(element, element.get("text") or "")
+            if pick is None:
+                options = normalized_options(element)
+                pick = options[0] if options else None
+            if pick:
                 actions.append({
                     "action_type": "select_option",
                     "element_id": element["id"],
-                    "value": pick["text"] or pick["value"],
-                    "reasoning": f"select valid option for {key_for(element)}",
+                    "value": pick.get("text") or pick.get("value", ""),
+                    "reasoning": f"select option for {key_for(element)}",
                 })
             else:
                 unsupported.append(element)
@@ -242,3 +278,123 @@ def heuristic_decide(elements: list[dict[str, Any]], page_text: str = "") -> dic
         "memory_note": None,
         "source": "heuristic",
     }
+
+
+def heuristic_preanswer(elements: list[dict[str, Any]], page_text: str = "") -> dict[str, Any]:
+    """Run deterministic pre-answering and split elements into:
+
+    - ``actions``: what the heuristic can answer right now (radios, checkboxes,
+      empty selects, empty text fields).
+    - ``remaining``: elements that need human/AI judgment (already-answered
+      groups, non-obvious picks, unsupported widgets, captcha-like traps).
+    """
+    actionable = [e for e in elements if not e.get("disabled")]
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for element in actionable:
+        if real_input_kind(element) in {"radio", "checkbox"}:
+            groups[key_for(element)].append(element)
+
+    actions: list[dict[str, Any]] = []
+    remaining: list[dict[str, Any]] = []
+    handled_groups: set[str] = set()
+
+    for element in actionable:
+        kind = real_input_kind(element)
+
+        if kind in {"radio", "checkbox"}:
+            group_key = key_for(element)
+            if group_key in handled_groups:
+                continue
+            handled_groups.add(group_key)
+            group = groups[group_key]
+
+            if kind == "radio":
+                if any(bool(item.get("checked")) for item in group):
+                    remaining.append(element)
+                    continue
+                pick = choose_radio(group)
+                actions.append({
+                    "action_type": "click",
+                    "element_id": pick["id"],
+                    "reasoning": f"answer radio group {group_key}",
+                })
+                continue
+
+            # checkbox
+            local_context = " ".join(
+                str(item.get("context") or item.get("text") or "")
+                for item in group
+            ).lower()
+            select_all = "select all" in local_context or (
+                len([g for g in groups.values()
+                     if g and real_input_kind(g[0]) == "checkbox"]) == 1 and
+                "select all" in page_text.lower()
+            )
+            safe = [
+                item for item in group
+                if str(item.get("option_value") or item.get("text") or "")
+                .strip().lower() not in NONE_WORDS
+            ]
+            if select_all:
+                picks = [item for item in safe if not item.get("checked")]
+            else:
+                if any(bool(item.get("checked")) for item in group):
+                    remaining.append(element)
+                    continue
+                picks = safe[:1]
+
+            for pick in picks:
+                actions.append({
+                    "action_type": "click",
+                    "element_id": pick["id"],
+                    "reasoning": f"answer checkbox group {group_key}",
+                })
+            continue
+
+        if kind == "select":
+            if str(element.get("value") or "").strip():
+                remaining.append(element)
+                continue
+            pick = match_option(element, element.get("text") or "")
+            if pick is None:
+                options = normalized_options(element)
+                pick = options[0] if options else None
+            if pick:
+                actions.append({
+                    "action_type": "select_option",
+                    "element_id": element["id"],
+                    "value": pick.get("text") or pick.get("value", ""),
+                    "reasoning": f"select option for {key_for(element)}",
+                })
+            else:
+                remaining.append(element)
+            continue
+
+        if kind in TEXT_KINDS | {"editable", "textarea"}:
+            if str(element.get("value") or "").strip():
+                remaining.append(element)
+                continue
+            actions.append({
+                "action_type": "type",
+                "element_id": element["id"],
+                "value": fill_value(element),
+                "reasoning": f"fill {key_for(element)}",
+            })
+            continue
+
+        remaining.append(element)
+
+    return {
+        "actions": actions,
+        "remaining": remaining,
+        "remaining_count": len(remaining),
+        "preanswered_count": len(actions),
+    }
+
+
+def detect_captcha(page_text: str) -> bool:
+    indicators = [
+        "recaptcha", "hcaptcha", "turnstile", "g-recaptcha", "h-captcha"
+    ]
+    lower = page_text.lower()
+    return any(ind in lower for ind in indicators)

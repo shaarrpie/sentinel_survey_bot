@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"><title>Encuesta</title></head>
+<body>
+<h2>¿Cuál es su edad?</h2>
+<label><input type="radio" name="age" value="18-24"> 18-24</label><br>
+<label><input type="radio" name="age" value="25-34"> 25-34</label><br>
+<label><input type="radio" name="age" value="35+"> 35+</label>
+<br><br>
+<button id="next">Siguiente</button>
+<script>
+  document.getElementById('next').addEventListener('click', () => {
+    document.body.innerHTML = '<h1>Gracias por completar la encuesta</h1>';
+  });
+</script>
+</body>
+</html>

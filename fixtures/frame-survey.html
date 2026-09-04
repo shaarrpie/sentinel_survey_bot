@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Iframe Survey</title></head>
+<body>
+<h3>Iframe question</h3>
+<label><input type="radio" name="region" value="North"> North</label><br>
+<label><input type="radio" name="region" value="South"> South</label><br>
+<label><input type="radio" name="region" value="East"> East</label><br>
+<label><input type="radio" name="region" value="West"> West</label>
+<script>
+  document.querySelectorAll('input[name="region"]').forEach(r => {
+    r.addEventListener('change', () => {
+      parent.postMessage({type: 'survey-answer', value: r.value}, '*');
+    });
+  });
+</script>
+</body>
+</html>
