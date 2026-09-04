@@ -24,8 +24,10 @@ deterministic heuristic takes over when the provider is unavailable.
 
 | Path | What |
 |---|---|
-| `extension/` | MV3 Chrome extension: HUD, polling loop, element map, panel-hub stop |
+| `extension/` | MV3 Chrome extension: HUD, polling loop, role-based element map, panel-hub stop |
 | `backend.py` | FastAPI server: `/decide` (LLM primary, heuristic fallback), `/learn`, `/status`, `/omni`, `/traces`, `/config/panel-hub` |
+| `core.py` | Standalone Selenium loop (undetected-chromedriver) — F12-driven, no extension needed |
+| `main.py` | Entry point for the standalone Selenium loop |
 | `sentinel_heuristic.py` | The one deterministic fallback + `real_input_kind()` element classifier |
 | `sentinel_traces.py` | Thread-safe trace bus, `/traces` poll endpoint, `omni_call()` wrapper |
 | `provider_health.py` | Cached `/models` health probe (30s cache, 5s timeout) |
@@ -35,9 +37,8 @@ deterministic heuristic takes over when the provider is unavailable.
 | `templates/trace.html` | Self-viewing HTML archive written per `/decide` call |
 | `examples/mock_form_bot.py` | Minimal form bot against the specimen |
 
-The extension + `backend.py` pair is the current product. Standalone
-`core.py` / `bot.py` loops were removed in r30 to eliminate divergent
-behavior and dead dependencies.
+Two supported paths: the extension + `backend.py` pair (current product),
+and the standalone Selenium loop (`core.py` + `main.py`).
 
 ## Element map schema
 
@@ -85,11 +86,13 @@ copy .env.example .env
 
 ## Running
 
-- **Extension (current):** open a survey (e.g.
+- **Extension:** open a survey (e.g.
   `http://127.0.0.1:<port>/survey-test.html`), open the HUD (toolbar icon
   → Open HUD) and press **Start**. Content script injection is on demand:
   the extension injects content scripts into the tab when you start a run
   and re-injects after hard navigations of the running tab.
+- **Standalone Selenium:** `python main.py` (`core.py` loop, uses
+  undetected-chromedriver — no extension needed).
 - **Specimen smoke test:** `python smoke_survey_test.py`
   (needs `playwright` + `playwright install chromium`).
 
@@ -110,6 +113,8 @@ form you control.
 - The extension holds host permissions so it can script-inject into
   the survey tab on demand. That is a real privilege; keep the extension
   on a machine/profile where you'd rather not have other extensions' bugs.
+- The standalone Selenium loop uses `undetected-chromedriver` for stealth;
+  that binary lives in your roaming profile and is your responsibility.
 - **Traces** (`SENTINEL_TRACES`, default `./traces`, gitignored) contain
   page text, the element map, and prompt material. They are pruned by age
   (`SENTINEL_TRACE_AGE_HOURS`, default 72h) *and* count (400). Treat the
@@ -135,6 +140,9 @@ the day they drift. CI runs all of them plus a full-bytecode compile
 
 ## Known sharp edges
 
+- Two supported paths share the same backend but have independent
+  frontends: the extension + `backend.py` pair, and the standalone
+  `core.py` Selenium loop. Bug fixes should land in both.
 - `content.js` is modular (state / fingerprint / element-map / actions /
   nav) and shares one isolated world via manifest `content_scripts`.
   The collector is role-based and pierces open shadow roots; closed
