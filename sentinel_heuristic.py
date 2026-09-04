@@ -24,6 +24,7 @@ three consumers.
 
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
 from collections import defaultdict
@@ -36,6 +37,13 @@ NONE_WORDS = {"none", "none of the above", "no", "neither", "not applicable",
 NON_TEXT_INPUTS = {"hidden", "button", "submit", "reset", "image", "file"}
 TEXT_KINDS = {"text", "email", "tel", "number", "date", "datetime-local",
               "time", "month", "week", "password", "url", "search", "range"}
+
+DEFAULT_FILL_VALUES = {
+    "age": os.getenv("SENTINEL_FILL_AGE", "32"),
+    "postal": os.getenv("SENTINEL_FILL_POSTAL", "400001"),
+    "zip": os.getenv("SENTINEL_FILL_ZIP", "400001"),
+    "email": os.getenv("SENTINEL_FILL_EMAIL", "tester@example.com"),
+}
 
 
 def _norm(s: str) -> str:
@@ -124,11 +132,11 @@ def fill_value(element: dict[str, Any]) -> str:
     clue = f"{name} {text}"
 
     if "age" in clue:
-        return "32"
+        return DEFAULT_FILL_VALUES["age"]
     if "postal" in clue or "zip" in clue:
-        return "400001"
+        return DEFAULT_FILL_VALUES["postal"]
     if "email" in clue:
-        return "tester@example.com"
+        return DEFAULT_FILL_VALUES["email"]
     if kind == "date":
         return "1994-01-01"
     if kind == "datetime-local":

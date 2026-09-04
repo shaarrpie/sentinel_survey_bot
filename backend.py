@@ -284,10 +284,11 @@ def load_rules():
         logger.warning("[rules] could not load %s", RULES_FILE, exc_info=True)
 
 def save_rules():
-    try:
-        RULES_FILE.write_text(json.dumps(LEARNED_RULES, indent=2), encoding="utf-8")
-    except Exception:
-        logger.warning("[rules] could not save %s", RULES_FILE, exc_info=True)
+    with _state_lock:
+        try:
+            RULES_FILE.write_text(json.dumps(LEARNED_RULES, indent=2), encoding="utf-8")
+        except Exception:
+            logger.warning("[rules] could not save %s", RULES_FILE, exc_info=True)
 
 load_rules()
 
@@ -837,16 +838,17 @@ async def learn_rule(req: LearnRequest):
 @app.get("/status")
 async def status():
     provider = await asyncio.to_thread(provider_health.health)
-    out = {
-        "status": "ok",
-        "backend_ready": client is not None,
-        "dry_run": DRY_RUN,
-        "trace_on": TRACE_ON,
-        "traces": len(list(TRACES_DIR.glob("*.html"))),
-        "memory_count": sum(len(v) for v in MEMORY.values()),
-        "sessions": len(MEMORY),
-        "rules_count": len(LEARNED_RULES),
-    }
+    with _state_lock:
+        out = {
+            "status": "ok",
+            "backend_ready": client is not None,
+            "dry_run": DRY_RUN,
+            "trace_on": TRACE_ON,
+            "traces": len(list(TRACES_DIR.glob("*.html"))),
+            "memory_count": sum(len(v) for v in MEMORY.values()),
+            "sessions": len(MEMORY),
+            "rules_count": len(LEARNED_RULES),
+        }
     bus.set_omni_health(
         loaded=provider["api_ready"],
         model=provider["model"],

@@ -530,7 +530,14 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
           !/^https?:/.test(tab.url || '')) return;
       chrome.scripting.executeScript({
         target: { tabId, allFrames: true },
-        files: ['content.js']
+        files: [
+          'extension/modules/state.js',
+          'extension/modules/fingerprint.js',
+          'extension/modules/element-map.js',
+          'extension/modules/actions.js',
+          'extension/modules/nav.js',
+          'extension/content.js'
+        ]
       }).catch((e) => {
         logs.push({ t: Date.now(),
                     line: 're-inject after navigation failed: ' + e.message,
